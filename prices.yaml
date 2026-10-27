@@ -1,0 +1,23 @@
+# Model pricing configuration for Downshift
+# Input and output rates are in USD per million tokens ($/Mtok)
+# Fill in official values from Nebius Token Factory pricing before running.
+# Null values are checked by Downshift and will raise an explicit error when computing cost.
+
+verified_for_live: false
+
+models:
+  nemotron_ultra:
+    model_id: "nvidia/Nemotron-3-Ultra-550b-a55b"
+    input_per_mtok: 1.00
+    output_per_mtok: 3.00
+    source: "Nebius Token Factory"
+  nemotron_super:
+    model_id: "nvidia/nemotron-3-super-120b-a12b"
+    input_per_mtok: 0.30
+    output_per_mtok: 0.90
+    source: "Nebius Token Factory"
+  nemotron_nano:
+    model_id: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
+    input_per_mtok: 0.06
+    output_per_mtok: 0.24
+    source: "Nebius Token Factory"
