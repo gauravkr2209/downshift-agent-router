@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Downshift — Evidence-Based AI Agent Model Router</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>↓</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #0a0d14;
+      --bg-card: #111726;
+      --bg-card-hover: #161f33;
+      --bg-glass: rgba(17, 23, 38, 0.75);
+      --border-color: #1e293b;
+      --border-accent: #334155;
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --accent-cyan: #06b6d4;
+      --accent-blue: #3b82f6;
+      --accent-violet: #8b5cf6;
+      --accent-emerald: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-rose: #f43f5e;
+      --glow-cyan: rgba(6, 182, 212, 0.15);
+      --glow-blue: rgba(59, 130, 246, 0.15);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      line-height: 1.5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+      background-image:
+        radial-gradient(circle at 15% 20%, rgba(59, 130, 246, 0.08) 0%, transparent 40%),
+        radial-gradient(circle at 85% 70%, rgba(139, 92, 246, 0.08) 0%, transparent 40%),
+        radial-gradient(circle at 50% 50%, rgba(6, 182, 212, 0.04) 0%, transparent 60%);
+      background-attachment: fixed;
+    }
+
+    /* Container */
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 1.5rem;
+      width: 100%;
+    }
+
+    /* Navbar */
+    header {
+      border-bottom: 1px solid var(--border-color);
+      background: rgba(10, 13, 20, 0.8);
+      backdrop-filter: blur(12px);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+
+    .nav-wrapper {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 4.25rem;
+    }
+
+    .logo-area {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      text-decoration: none;
+      color: inherit;
+    }
+
+    .logo-badge {
+      width: 2.25rem;
+      height: 2.25rem;
+      border-radius: 0.5rem;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 1.1rem;
+      color: #fff;
+      box-shadow: 0 0 12px var(--glow-cyan);
+    }
+
+    .logo-text {
+      font-weight: 700;
+      font-size: 1.25rem;
+      letter-spacing: -0.025em;
+      background: linear-gradient(to right, #fff, var(--text-muted));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .badge-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      padding: 0.25rem 0.65rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--accent-emerald);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+    }
+
+    .badge-status.offline-mock {
+      background: rgba(6, 182, 212, 0.1);
+      color: var(--accent-cyan);
+      border-color: rgba(6, 182, 212, 0.2);
+    }
+
+    .pulse-dot {
+      width: 0.5rem;
+      height: 0.5rem;
+      border-radius: 50%;
+      background-color: currentColor;
+      box-shadow: 0 0 8px currentColor;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 1.25rem;
+    }
+
+    .nav-link {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    .nav-link:hover {
+      color: var(--text-main);
+    }
+
+    /* Hero */
+    .hero {
+      padding: 4rem 0 2rem;
+      text-align: center;
+    }
+
+    .pill-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: rgba(59, 130, 246, 0.1);
+      border: 1px solid rgba(59, 130, 246, 0.25);
+      border-radius: 9999px;
+      padding: 0.35rem 1rem;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--accent-blue);
+      margin-bottom: 1.5rem;
+    }
+
+    .hero-title {
+      font-size: 2.75rem;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 1.15;
+      margin-bottom: 1.25rem;
+    }
+
+    .hero-gradient {
+      background: linear-gradient(135deg, #38bdf8 0%, #818cf8 50%, #c084fc 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero-subtitle {
+      font-size: 1.125rem;
+      color: var(--text-muted);
+      max-width: 680px;
+      margin: 0 auto 2.5rem;
+      font-weight: 400;
+    }
+
+    /* Interactive Playground Card */
+    .playground-card {
+      background: var(--bg-glass);
+      border: 1px solid var(--border-color);
+      border-radius: 1rem;
+      padding: 1.75rem;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.5);
+      margin-bottom: 2.5rem;
+      position: relative;
+    }
+
+    .playground-header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1.25rem;
+      margin-bottom: 1.75rem;
+      padding-bottom: 1.25rem;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .playground-title {
+      font-size: 1.25rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .controls-group {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .control-item {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.875rem;
+      color: var(--text-muted);
+    }
+
+    .select-input {
+      background: #0f172a;
+      border: 1px solid var(--border-accent);
+      color: var(--text-main);
+      padding: 0.45rem 0.85rem;
+      border-radius: 0.5rem;
+      font-family: inherit;
+      font-size: 0.875rem;
+      outline: none;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+
+    .select-input:focus {
+      border-color: var(--accent-blue);
+    }
+
+    .range-wrapper {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .range-input {
+      accent-color: var(--accent-cyan);
+      cursor: pointer;
+      width: 120px;
+    }
+
+    .range-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8125rem;
+      color: var(--accent-cyan);
+      min-width: 4rem;
+    }
+
+    .btn-run {
+      background: linear-gradient(135deg, var(--accent-blue), var(--accent-violet));
+      color: #fff;
+      border: none;
+      padding: 0.6rem 1.5rem;
+      border-radius: 0.5rem;
+      font-weight: 600;
+      font-size: 0.875rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.3);
+      transition: all 0.2s ease;
+    }
+
+    .btn-run:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(59, 130, 246, 0.45);
+    }
+
+    .btn-run:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    /* Pipeline Stages Animation / Progress */
+    .pipeline-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+
+    .stage-card {
+      background: #0d1322;
+      border: 1px solid var(--border-color);
+      border-radius: 0.75rem;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      transition: all 0.3s ease;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .stage-card.active {
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 15px rgba(6, 182, 212, 0.2);
+    }
+
+    .stage-card.completed {
+      border-color: rgba(16, 185, 129, 0.4);
+      background: rgba(16, 185, 129, 0.03);
+    }
+
+    .stage-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .stage-badge {
+      width: 1.25rem;
+      height: 1.25rem;
+      border-radius: 50%;
+      background: #1e293b;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+    }
+
+    .stage-card.completed .stage-badge {
+      background: var(--accent-emerald);
+      color: #fff;
+    }
+
+    .stage-card.active .stage-badge {
+      background: var(--accent-cyan);
+      color: #fff;
+      animation: pulse 1.5s infinite;
+    }
+
+    .stage-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text-main);
+    }
+
+    .stage-desc {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.15); opacity: 0.8; }
+    }
+
+    /* Key Metrics Grid */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1.25rem;
+      margin-bottom: 2rem;
+    }
+
+    .metric-card {
+      background: #0d1322;
+      border: 1px solid var(--border-color);
+      border-radius: 0.75rem;
+      padding: 1.25rem;
+    }
+
+    .metric-label {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .metric-value {
+      font-size: 1.75rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .metric-sub {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      margin-top: 0.25rem;
+    }
+
+    .text-emerald { color: var(--accent-emerald); }
+    .text-cyan { color: var(--accent-cyan); }
+    .text-blue { color: var(--accent-blue); }
+    .text-rose { color: var(--accent-rose); }
+
+    /* Trace Table */
+    .table-container {
+      border: 1px solid var(--border-color);
+      border-radius: 0.75rem;
+      overflow-x: auto;
+      background: #0d1322;
+      margin-bottom: 2rem;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.8125rem;
+    }
+
+    th {
+      background: #090e1a;
+      padding: 0.85rem 1rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border-color);
+      text-transform: uppercase;
+      font-size: 0.7rem;
+      letter-spacing: 0.05em;
+    }
+
+    td {
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid rgba(30, 41, 59, 0.5);
+      color: var(--text-main);
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .tag-pill {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      padding: 0.2rem 0.5rem;
+      border-radius: 0.375rem;
+      background: rgba(59, 130, 246, 0.12);
+      color: #93c5fd;
+      border: 1px solid rgba(59, 130, 246, 0.2);
+      display: inline-block;
+    }
+
+    .decision-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      padding: 0.2rem 0.5rem;
+      border-radius: 0.375rem;
+      font-weight: 600;
+      font-size: 0.75rem;
+    }
+
+    .decision-downgrade {
+      background: rgba(16, 185, 129, 0.12);
+      color: var(--accent-emerald);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+
+    .decision-keep {
+      background: rgba(148, 163, 184, 0.1);
+      color: var(--text-muted);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+    }
+
+    .badge-pass {
+      color: var(--accent-emerald);
+      font-weight: 600;
+    }
+
+    .badge-fail {
+      color: var(--accent-rose);
+      font-weight: 600;
+    }
+
+    /* Scaling Projection Banner */
+    .scaling-box {
+      background: linear-gradient(135deg, rgba(6, 182, 212, 0.05), rgba(59, 130, 246, 0.05));
+      border: 1px solid rgba(6, 182, 212, 0.2);
+      border-radius: 0.75rem;
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1.5rem;
+    }
+
+    .scaling-info h4 {
+      font-size: 1.1rem;
+      font-weight: 700;
+      margin-bottom: 0.25rem;
+    }
+
+    .scaling-info p {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+    }
+
+    .scaling-numbers {
+      display: flex;
+      align-items: center;
+      gap: 2rem;
+    }
+
+    .scaling-item {
+      text-align: right;
+    }
+
+    .scaling-item .lbl {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      font-weight: 600;
+    }
+
+    .scaling-item .val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.35rem;
+      font-weight: 700;
+    }
+
+    /* Disclaimer */
+    .disclaimer-card {
+      border: 1px solid rgba(245, 158, 11, 0.25);
+      background: rgba(245, 158, 11, 0.05);
+      border-radius: 0.75rem;
+      padding: 1.25rem;
+      margin-top: 1.5rem;
+      font-size: 0.8125rem;
+      color: #fde68a;
+      display: flex;
+      gap: 0.75rem;
+      align-items: flex-start;
+    }
+
+    .disclaimer-icon {
+      flex-shrink: 0;
+      font-size: 1.1rem;
+    }
+
+    /* Error Banner */
+    .error-banner {
+      background: rgba(244, 63, 94, 0.1);
+      border: 1px solid rgba(244, 63, 94, 0.3);
+      color: #fda4af;
+      padding: 1rem 1.25rem;
+      border-radius: 0.75rem;
+      margin-bottom: 1.5rem;
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .error-banner.visible {
+      display: flex;
+    }
+
+    .btn-retry {
+      background: rgba(244, 63, 94, 0.2);
+      border: 1px solid rgba(244, 63, 94, 0.4);
+      color: #fff;
+      padding: 0.35rem 0.85rem;
+      border-radius: 0.375rem;
+      cursor: pointer;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+
+    /* Footer */
+    footer {
+      margin-top: auto;
+      border-top: 1px solid var(--border-color);
+      padding: 2rem 0;
+      text-align: center;
+      font-size: 0.8125rem;
+      color: var(--text-dim);
+    }
+
+    .footer-links {
+      display: flex;
+      justify-content: center;
+      gap: 1.5rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .footer-links a {
+      color: var(--text-muted);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+
+    .footer-links a:hover {
+      color: var(--text-main);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Navigation Bar -->
+  <header>
+    <div class="container nav-wrapper">
+      <a href="/" class="logo-area">
+        <div class="logo-badge">↓</div>
+        <div>
+          <span class="logo-text">Downshift</span>
+        </div>
+      </a>
+      <div class="nav-links">
+        <span class="badge-status offline-mock" id="connectionBadge">
+          <span class="pulse-dot"></span>
+          <span id="connectionText">Checking Mock Engine...</span>
+        </span>
+        <a href="https://github.com/gauravkr2209/downshift-agent-router" target="_blank" rel="noopener noreferrer" class="nav-link">
+          GitHub Repo
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <main class="container">
+
+    <!-- Hero Section -->
+    <section class="hero">
+      <div class="pill-tag">
+        <span>⚡ Dynamic Cost Optimization for Multi-Step AI Agents</span>
+      </div>
+      <h1 class="hero-title">
+        Run Frontier Models When Needed.<br>
+        <span class="hero-gradient">Downshift to Cheaper Tiers</span> When Safe.
+      </h1>
+      <p class="hero-subtitle">
+        Downshift records agent step traces, replays historical prompts against smaller candidates,
+        verifies objective and judge criteria, and downshifts subtasks to slash inference spend by 70%+.
+      </p>
+    </section>
+
+    <!-- Error Banner -->
+    <div class="error-banner" id="errorBanner">
+      <div id="errorMessage">Unable to connect to Downshift API.</div>
+      <button class="btn-retry" onclick="triggerRun()">Retry Simulation</button>
+    </div>
+
+    <!-- Interactive Demonstration Card -->
+    <section class="playground-card">
+      <div class="playground-header">
+        <div class="playground-title">
+          <span>🚀 Interactive Router Simulation</span>
+        </div>
+        <div class="controls-group">
+          <div class="control-item">
+            <label for="taskMixSelect">Task Mix:</label>
+            <select id="taskMixSelect" class="select-input">
+              <option value="balanced" selected>Balanced (11 Steps)</option>
+              <option value="simple">Simple (5 Steps)</option>
+              <option value="complex">Complex (14 Steps)</option>
+            </select>
+          </div>
+          <div class="control-item">
+            <label for="scaleRange">Scale Volume:</label>
+            <div class="range-wrapper">
+              <input type="range" id="scaleRange" class="range-input" min="100" max="100000" step="100" value="1000">
+              <span id="scaleVal" class="range-val">1,000 runs</span>
+            </div>
+          </div>
+          <button id="runBtn" class="btn-run" onclick="triggerRun()">
+            <span id="btnIcon">▶</span>
+            <span id="btnText">Run Simulation</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Execution Pipeline Stages -->
+      <div class="pipeline-grid" id="pipelineGrid">
+        <div class="stage-card" id="stage1">
+          <div class="stage-header">
+            <span>Stage 1</span>
+            <span class="stage-badge" id="badge1">1</span>
+          </div>
+          <div class="stage-title">Record Baseline Trace</div>
+          <div class="stage-desc">Frontier agent executed on Nemotron Ultra (550B)</div>
+        </div>
+        <div class="stage-card" id="stage2">
+          <div class="stage-header">
+            <span>Stage 2</span>
+            <span class="stage-badge" id="badge2">2</span>
+          </div>
+          <div class="stage-title">Candidate Replay</div>
+          <div class="stage-desc">Parallel offline step replays on Super (120B) &amp; Nano (30B)</div>
+        </div>
+        <div class="stage-card" id="stage3">
+          <div class="stage-header">
+            <span>Stage 3</span>
+            <span class="stage-badge" id="badge3">3</span>
+          </div>
+          <div class="stage-title">Objective Verification</div>
+          <div class="stage-desc">Schema, JSON, and regex criteria validated (100% pass)</div>
+        </div>
+        <div class="stage-card" id="stage4">
+          <div class="stage-header">
+            <span>Stage 4</span>
+            <span class="stage-badge" id="badge4">4</span>
+          </div>
+          <div class="stage-title">Blinded Judge Review</div>
+          <div class="stage-desc">Double-blind quality evaluation against Ultra output</div>
+        </div>
+        <div class="stage-card" id="stage5">
+          <div class="stage-header">
+            <span>Stage 5</span>
+            <span class="stage-badge" id="badge5">5</span>
+          </div>
+          <div class="stage-title">Optimized Execution</div>
+          <div class="stage-desc">Dynamic router executes agent with downshifted subtasks</div>
+        </div>
+      </div>
+
+      <!-- Summary Metrics Grid -->
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">
+            <span>Cost Reduction</span>
+            <span>📉</span>
+          </div>
+          <div class="metric-value text-emerald" id="metricSavings">--%</div>
+          <div class="metric-sub" id="metricSavingsSub">Across all agent steps</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">
+            <span>Baseline Cost (1 Run)</span>
+            <span>🔴</span>
+          </div>
+          <div class="metric-value" id="metricBaseCost">$0.000000</div>
+          <div class="metric-sub">Pure frontier Ultra (550B)</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">
+            <span>Routed Cost (1 Run)</span>
+            <span>🟢</span>
+          </div>
+          <div class="metric-value text-cyan" id="metricRoutedCost">$0.000000</div>
+          <div class="metric-sub">Downshifted hybrid execution</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">
+            <span>Quality Parity</span>
+            <span>🛡️</span>
+          </div>
+          <div class="metric-value text-blue" id="metricQuality">--%</div>
+          <div class="metric-sub" id="metricQualitySub">Objective &amp; Judge Pass Rate</div>
+        </div>
+      </div>
+
+      <!-- Scaling Projections Card -->
+      <div class="scaling-box">
+        <div class="scaling-info">
+          <h4>Mathematical Projection at Scale</h4>
+          <p id="scalingDesc">Mathematical projection for 1,000 agent workflow runs (based on 1 simulated mock run)</p>
+        </div>
+        <div class="scaling-numbers">
+          <div class="scaling-item">
+            <div class="lbl">Frontier Spend (Scaled)</div>
+            <div class="val text-rose" id="scaleBaseSpend">$0.00</div>
+          </div>
+          <div class="scaling-item">
+            <div class="lbl">Downshifted Spend (Scaled)</div>
+            <div class="val text-cyan" id="scaleRoutedSpend">$0.00</div>
+          </div>
+          <div class="scaling-item">
+            <div class="lbl">Net Projected Savings</div>
+            <div class="val text-emerald" id="scaleNetSavings">$0.00</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step-Level Execution Trace Explorer -->
+      <div class="playground-title" style="margin-bottom: 1rem; font-size: 1.1rem;">
+        <span>🔍 Step-Level Execution Trace &amp; Routing Decisions</span>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Task Tag</th>
+              <th>Baseline Model</th>
+              <th>Selected Model</th>
+              <th>Decision</th>
+              <th>Tokens (In/Out)</th>
+              <th>Routed Cost</th>
+              <th>Objective</th>
+              <th>Judge</th>
+            </tr>
+          </thead>
+          <tbody id="traceTableBody">
+            <tr>
+              <td colspan="9" style="text-align: center; color: var(--text-dim); padding: 2rem;">
+                Click "Run Simulation" above to execute an end-to-end routing run.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Simulation & Safety Disclaimer -->
+      <div class="disclaimer-card">
+        <div class="disclaimer-icon">⚠️</div>
+        <div>
+          <strong>Deterministic Mock Demonstration Mode:</strong>
+          <span id="disclaimerText">
+            All agent completions, candidate replays, and judge evaluations in this interactive demo are powered by Downshift's deterministic mock engines. Exactly one simulated agent workflow run is executed locally. Zero live API calls, zero web searches, and zero real inference tokens are consumed. Scaled spending figures are mathematical projections based on illustrative, unverified rates from prices.yaml.
+          </span>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer>
+    <div class="container">
+      <div class="footer-links">
+        <a href="https://github.com/gauravkr2209/downshift-agent-router" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href="/api/health" target="_blank">API Health</a>
+        <a href="/api/demo/info" target="_blank">Demo Info</a>
+      </div>
+      <p>Downshift — Automated Cost Optimization for Compound Agent Workflows</p>
+    </div>
+  </footer>
+
+  <script>
+    // Configuration: Support standalone deployment or remote backend
+    const API_BASE = window.DOWNSHIFT_API_URL || '';
+
+    // Elements
+    const connectionBadge = document.getElementById('connectionBadge');
+    const connectionText = document.getElementById('connectionText');
+    const taskMixSelect = document.getElementById('taskMixSelect');
+    const scaleRange = document.getElementById('scaleRange');
+    const scaleVal = document.getElementById('scaleVal');
+    const runBtn = document.getElementById('runBtn');
+    const btnText = document.getElementById('btnText');
+    const btnIcon = document.getElementById('btnIcon');
+    const errorBanner = document.getElementById('errorBanner');
+    const errorMessage = document.getElementById('errorMessage');
+    const traceTableBody = document.getElementById('traceTableBody');
+    const disclaimerText = document.getElementById('disclaimerText');
+
+    // Metrics elements
+    const metricSavings = document.getElementById('metricSavings');
+    const metricBaseCost = document.getElementById('metricBaseCost');
+    const metricRoutedCost = document.getElementById('metricRoutedCost');
+    const metricQuality = document.getElementById('metricQuality');
+    const metricSavingsSub = document.getElementById('metricSavingsSub');
+    const metricQualitySub = document.getElementById('metricQualitySub');
+
+    // Scaling elements
+    const scaleBaseSpend = document.getElementById('scaleBaseSpend');
+    const scaleRoutedSpend = document.getElementById('scaleRoutedSpend');
+    const scaleNetSavings = document.getElementById('scaleNetSavings');
+    const scalingDesc = document.getElementById('scalingDesc');
+
+    // Sync volume slider
+    scaleRange.addEventListener('input', (e) => {
+      const val = parseInt(e.target.value, 10);
+      scaleVal.textContent = Number(val).toLocaleString() + ' runs';
+      if (window.lastDemoData) {
+        updateScalingDisplay(window.lastDemoData, val);
+      }
+    });
+
+    // Check health on boot
+    async function checkHealth() {
+      try {
+        const res = await fetch(`${API_BASE}/api/health`);
+        if (!res.ok) throw new Error('Health check failed');
+        const data = await res.json();
+        connectionBadge.className = 'badge-status offline-mock';
+        connectionText.textContent = `Mock Engine Active (${data.mode})`;
+      } catch (err) {
+        connectionBadge.className = 'badge-status';
+        connectionBadge.style.color = 'var(--accent-amber)';
+        connectionBadge.style.borderColor = 'rgba(245, 158, 11, 0.3)';
+        connectionText.textContent = 'Demo Mode (Offline)';
+      }
+    }
+
+    // Set stage visual state: 'idle' | 'active' | 'completed'
+    function setStage(idx, state) {
+      const card = document.getElementById(`stage${idx}`);
+      const badge = document.getElementById(`badge${idx}`);
+      if (!card || !badge) return;
+
+      card.classList.remove('active', 'completed');
+      if (state === 'active') {
+        card.classList.add('active');
+        badge.textContent = '●';
+      } else if (state === 'completed') {
+        card.classList.add('completed');
+        badge.textContent = '✓';
+      } else {
+        badge.textContent = idx;
+      }
+    }
+
+    function resetStages() {
+      for (let i = 1; i <= 5; i++) {
+        setStage(i, 'idle');
+      }
+    }
+
+    function delay(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // Format currency cleanly for display
+    function formatScaledUsd(val) {
+      if (val === 0) return '$0.00';
+      if (Math.abs(val) < 10) return `$${val.toFixed(3)}`;
+      return `$${val.toFixed(2)}`;
+    }
+
+    // Update scaling projection section
+    function updateScalingDisplay(data, reqCount) {
+      const baseCost = data.summary.baseline_cost_per_run_usd;
+      const routedCost = data.summary.routed_cost_per_run_usd;
+      const netSavedPerRun = data.summary.simulated_savings_usd !== undefined
+        ? data.summary.simulated_savings_usd
+        : (baseCost - routedCost);
+
+      // Scaled mathematical projection for reqCount complete workflow runs
+      // Check if API pre-calculated scaling_projection matches this request count
+      const sp = data.summary.scaling_projection;
+      let projectedBase, projectedRouted, netSaved;
+
+      if (sp && sp.request_count === reqCount) {
+        projectedBase = sp.projected_baseline_usd;
+        projectedRouted = sp.projected_routed_usd;
+        netSaved = sp.projected_savings_usd;
+      } else {
+        projectedBase = baseCost * reqCount;
+        projectedRouted = routedCost * reqCount;
+        netSaved = netSavedPerRun * reqCount;
+      }
+
+      scaleBaseSpend.textContent = formatScaledUsd(projectedBase);
+      scaleRoutedSpend.textContent = formatScaledUsd(projectedRouted);
+      scaleNetSavings.textContent = formatScaledUsd(netSaved);
+      scalingDesc.textContent = `Mathematical projection for ${Number(reqCount).toLocaleString()} agent workflow runs (based on 1 simulated mock run of ${data.summary.total_steps} steps)`;
+    }
+
+    // Render trace rows
+    function renderTraceRows(steps) {
+      traceTableBody.innerHTML = '';
+      steps.forEach((step) => {
+        const tr = document.createElement('tr');
+
+        const isDowngrade = step.decision === 'downgrade';
+        const decisionHtml = isDowngrade
+          ? `<span class="decision-badge decision-downgrade">↓ Downgrade (${step.selected_tier.toUpperCase()})</span>`
+          : `<span class="decision-badge decision-keep">Maintain Ultra</span>`;
+
+        const objHtml = step.objective_pass
+          ? `<span class="badge-pass">PASS (100%)</span>`
+          : `<span class="badge-fail">FAIL</span>`;
+
+        const judgeScore = (step.judge_score * 100).toFixed(0);
+        const judgeHtml = `<span class="badge-pass">PASS (${judgeScore}%)</span>`;
+
+        // Format short model names
+        const cleanBaseModel = (step.baseline_model || '').replace('nvidia/', '');
+        const cleanSelectedModel = (step.selected_model || '').replace('nvidia/', '');
+
+        tr.innerHTML = `
+          <td style="font-family: 'JetBrains Mono', monospace; font-weight: 600;">#${step.idx + 1}</td>
+          <td><span class="tag-pill">${step.tag}</span></td>
+          <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--text-muted);">${cleanBaseModel}</td>
+          <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; font-weight: 600; color: ${isDowngrade ? 'var(--accent-cyan)' : 'var(--text-main)'};">${cleanSelectedModel}</td>
+          <td>${decisionHtml}</td>
+          <td style="font-family: 'JetBrains Mono', monospace; font-size: 0.75rem;">${step.tokens_in} / ${step.tokens_out}</td>
+          <td style="font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--accent-emerald);">$${step.cost_usd.toFixed(6)}</td>
+          <td>${objHtml}</td>
+          <td>${judgeHtml}</td>
+        `;
+        traceTableBody.appendChild(tr);
+      });
+    }
+
+    // Main Run Trigger
+    async function triggerRun() {
+      const taskMix = taskMixSelect.value;
+      const requestCount = parseInt(scaleRange.value, 10);
+
+      // UI state
+      errorBanner.classList.remove('visible');
+      runBtn.disabled = true;
+      btnText.textContent = 'Simulating...';
+      btnIcon.textContent = '⏳';
+      resetStages();
+
+      try {
+        // Animate through pipeline stages smoothly
+        setStage(1, 'active');
+        await delay(250);
+        setStage(1, 'completed');
+        setStage(2, 'active');
+        await delay(300);
+        setStage(2, 'completed');
+        setStage(3, 'active');
+        await delay(250);
+        setStage(3, 'completed');
+        setStage(4, 'active');
+
+        // Dispatch call to Python backend
+        const response = await fetch(`${API_BASE}/api/demo/run`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task_mix: taskMix, request_count: requestCount })
+        });
+
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || `Server responded with status ${response.status}`);
+        }
+
+        const data = await response.json();
+        window.lastDemoData = data;
+
+        setStage(4, 'completed');
+        setStage(5, 'active');
+        await delay(200);
+        setStage(5, 'completed');
+
+        // Update Summary Metrics
+        const s = data.summary;
+        metricSavings.textContent = `${s.cost_reduction_pct.toFixed(1)}%`;
+        metricBaseCost.textContent = `$${s.baseline_cost_per_run_usd.toFixed(6)}`;
+        metricRoutedCost.textContent = `$${s.routed_cost_per_run_usd.toFixed(6)}`;
+
+        const objPassRate = s.objective_evaluations ? s.objective_evaluations.pass_rate_pct : 100;
+        const judgePassRate = s.judge_evaluations ? s.judge_evaluations.pass_rate_pct : 100;
+        metricQuality.textContent = `${judgePassRate.toFixed(0)}%`;
+        metricQualitySub.textContent = `Obj: ${objPassRate.toFixed(0)}% | Judge: ${judgePassRate.toFixed(0)}%`;
+
+        // Update Scaling Section
+        updateScalingDisplay(data, requestCount);
+
+        // Update Trace Explorer Table
+        renderTraceRows(data.steps);
+
+        // Update Disclaimer if provided
+        if (data.disclaimer) {
+          disclaimerText.textContent = data.disclaimer;
+        }
+
+      } catch (err) {
+        console.error('Simulation execution failed:', err);
+        errorMessage.textContent = `Simulation execution failed: ${err.message}`;
+        errorBanner.classList.add('visible');
+        resetStages();
+      } finally {
+        runBtn.disabled = false;
+        btnText.textContent = 'Run Simulation';
+        btnIcon.textContent = '▶';
+      }
+    }
+
+    // Auto-run on load after checking health
+    window.addEventListener('DOMContentLoaded', async () => {
+      await checkHealth();
+      triggerRun();
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: downshift-demo
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: "pip install uv && uv sync --frozen --no-dev"
+    startCommand: "uv run python -m server.app.api"
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
