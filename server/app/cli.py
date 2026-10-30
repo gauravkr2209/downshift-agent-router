@@ -8,8 +8,9 @@ from sqlmodel import Session, col, select
 
 from server.app import db as db_mod
 from server.app.checks import evaluate_run
+from server.app.config import settings
 from server.app.db import create_db_and_tables, sync_prices_from_yaml
-from server.app.judge import judge_run
+from server.app.judge import MockJudgeClient, judge_run
 from server.app.models import Evaluation, Replay, Run, Step
 from server.app.replay import MockReplayClient, replay_run
 from server.app.router import export_routing_config, recommend_routing
@@ -71,9 +72,7 @@ def inspect_run(run_id: str, session: Session | None = None) -> bool:
         print(f"Task Name      : {run_record.task_name}")
         print(f"Agent Name     : {run_record.agent_name}")
         print(f"Baseline Model : {run_record.baseline_model}")
-        unrec = (run_record.meta or {}).get("has_unreconciled_cost")
-        status_flag = " [FLAG: Unreconciled cost]" if unrec else ""
-        print(f"Status         : {run_record.status}{status_flag}")
+        print(f"Status         : {run_record.status}")
         print(f"Started At     : {run_record.started_at.isoformat()}")
         print(f"Step Count     : {len(steps)}")
         print(f"Tokens In      : {run_record.tokens_in} (Sum: {step_tokens_in})")
@@ -85,10 +84,9 @@ def inspect_run(run_id: str, session: Session | None = None) -> bool:
         if steps:
             print("Steps Breakdown:")
             for s in steps:
-                err_flag = " [FLAG: Error/Unreconciled step]" if s.kind == "error" else ""
                 print(
                     f"  [{s.idx:02d}] Tag: {s.tag:<15} Kind: {s.kind:<10} "
-                    f"Tokens: {s.tokens_in:>4} in / {s.tokens_out:>4} out | Cost: {format_usd(s.cost_usd)}{err_flag}"
+                    f"Tokens: {s.tokens_in:>4} in / {s.tokens_out:>4} out | Cost: {format_usd(s.cost_usd)}"
                 )
             print("-" * 60)
 
@@ -137,13 +135,6 @@ def list_runs(session: Session | None = None) -> None:
 
 def replay_command(args: argparse.Namespace) -> None:
     """Execute replay subcommand."""
-    if args.real:
-        print(
-            "REFUSAL: Real API calls are disabled in Phase 2 Step 2a. Replays only run in mock mode.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     tier_list = [t.strip() for t in args.tiers.split(",") if t.strip()]
     if not tier_list:
         print("Error: No tiers specified.", file=sys.stderr)
@@ -153,17 +144,62 @@ def replay_command(args: argparse.Namespace) -> None:
     with Session(db_mod.engine) as session:
         args.run_id = resolve_run_id(args.run_id, session)
 
-    print(f"Replaying run '{args.run_id}' across tiers: {', '.join(tier_list)} (Mode: MOCK)")
-    try:
+    if args.real:
+        if (
+            not settings.nebius_api_key
+            or "PLACEHOLDER" in settings.nebius_api_key.upper()
+            or settings.nebius_api_key.startswith("your_")
+        ):
+            print("REFUSAL: NEBIUS_API_KEY is not configured in .env.", file=sys.stderr)
+            sys.exit(1)
+
+        if not settings.nebius_base_url or "PLACEHOLDER" in settings.nebius_base_url.upper():
+            print("REFUSAL: NEBIUS_BASE_URL is not configured in .env.", file=sys.stderr)
+            sys.exit(1)
+
+        is_verified, reason = db_mod.check_live_pricing_verified()
+        if not is_verified:
+            print(f"REFUSAL: {reason}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            sync_prices_from_yaml()
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"REFUSAL: Pricing synchronization failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        from openai import OpenAI
+
+        client: Any = OpenAI(
+            api_key=settings.nebius_api_key,
+            base_url=settings.nebius_base_url,
+            timeout=settings.nebius_request_timeout,
+            max_retries=0,
+        )
+        max_workers = 1
+        retry_attempts = 1
+        is_live = True
+        print(
+            f"Replaying run '{args.run_id}' across tiers: {', '.join(tier_list)} (Mode: LIVE - Nebius Token Factory)"
+        )
+    else:
         client = MockReplayClient()
+        max_workers = args.max_workers
+        retry_attempts = None
+        is_live = False
+        print(f"Replaying run '{args.run_id}' across tiers: {', '.join(tier_list)} (Mode: MOCK)")
+
+    try:
         replays = replay_run(
             run_id=args.run_id,
             tiers=tier_list,
             client=client,
-            max_workers=args.max_workers,
+            max_workers=max_workers,
             max_steps=args.max_steps,
             cost_ceiling_usd=args.cost_ceiling,
             force=args.force,
+            retry_attempts=retry_attempts,
+            is_live=is_live,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"Error during replay: {exc}", file=sys.stderr)
@@ -264,13 +300,6 @@ def evaluate_command(run_id: str, session: Session | None = None) -> None:
 
 def judge_command(args: argparse.Namespace, session: Session | None = None) -> None:
     """Execute LLM quality judging for a run and print pass rate and quality report."""
-    if getattr(args, "real", False):
-        print(
-            "REFUSAL: Real API calls are disabled in Phase 2c. Quality judging only runs in mock mode.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     create_db_and_tables()
     close_session = False
     if session is None:
@@ -285,12 +314,60 @@ def judge_command(args: argparse.Namespace, session: Session | None = None) -> N
             sys.exit(1)
         args.run_id = target_run_id
 
-        evaluations = judge_run(
-            run_id=args.run_id,
-            judge_model=getattr(args, "model", None),
-            force=getattr(args, "force", False),
-            session=session,
-        )
+        is_live = bool(getattr(args, "real", False))
+        cost_ceiling = getattr(args, "cost_ceiling", 0.07)
+        if is_live:
+            if (
+                not settings.nebius_api_key
+                or "PLACEHOLDER" in settings.nebius_api_key.upper()
+                or settings.nebius_api_key.startswith("your_")
+            ):
+                print("REFUSAL: NEBIUS_API_KEY is not configured in .env.", file=sys.stderr)
+                sys.exit(1)
+
+            if not settings.nebius_base_url or "PLACEHOLDER" in settings.nebius_base_url.upper():
+                print("REFUSAL: NEBIUS_BASE_URL is not configured in .env.", file=sys.stderr)
+                sys.exit(1)
+
+            is_verified, reason = db_mod.check_live_pricing_verified()
+            if not is_verified:
+                print(f"REFUSAL: {reason}", file=sys.stderr)
+                sys.exit(1)
+
+            try:
+                sync_prices_from_yaml()
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"REFUSAL: Pricing synchronization failed: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+            from openai import OpenAI
+
+            client: Any = OpenAI(
+                api_key=settings.nebius_api_key,
+                base_url=settings.nebius_base_url,
+                timeout=settings.nebius_request_timeout,
+                max_retries=0,
+            )
+            print(
+                f"Judging run '{args.run_id}' (Mode: LIVE - Nebius Token Factory Judge) [Budget Ceiling: ${cost_ceiling:.4f}]"
+            )
+        else:
+            client = MockJudgeClient()
+            print(f"Judging run '{args.run_id}' (Mode: MOCK Judge)")
+
+        try:
+            evaluations = judge_run(
+                run_id=args.run_id,
+                client=client,
+                judge_model=getattr(args, "model", None),
+                force=getattr(args, "force", False),
+                session=session,
+                is_live=is_live,
+                cost_ceiling_usd=cost_ceiling,
+            )
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"Error during judging: {exc}", file=sys.stderr)
+            sys.exit(1)
 
         steps = session.exec(
             select(Step).where(Step.run_id == args.run_id).order_by(col(Step.idx))
@@ -348,6 +425,14 @@ def judge_command(args: argparse.Namespace, session: Session | None = None) -> N
             print(f"  {tier:<10}: {rate_str:<7} ({passed} / {total}) | Avg Score: {avg_str}")
         print("=" * 80)
         print(f"Total Evaluations Judged: {len(evaluations)}")
+        total_judge_cost = sum(ev.judge_cost_usd or 0.0 for ev in evaluations)
+        total_judge_tokens_in = sum(ev.judge_tokens_in or 0 for ev in evaluations)
+        total_judge_tokens_out = sum(ev.judge_tokens_out or 0 for ev in evaluations)
+        if total_judge_cost > 0.0 or total_judge_tokens_in > 0:
+            print(
+                f"Total Judge Tokens      : {total_judge_tokens_in} in / {total_judge_tokens_out} out"
+            )
+            print(f"Total Judge Cost        : {format_usd(total_judge_cost)}")
 
         if not tag_tier_stats and len(evaluations) == 0:
             print(
@@ -500,7 +585,13 @@ def main(argv: list[str] | None = None) -> None:
         judge_parser.add_argument("run_id", help="ID of the run to judge")
         judge_parser.add_argument("--model", default=None, help="Judge model identifier")
         judge_parser.add_argument(
-            "--real", action="store_true", help="Execute against real API (disabled in Phase 2c)"
+            "--real", action="store_true", help="Execute against real Nebius Token Factory API"
+        )
+        judge_parser.add_argument(
+            "--cost-ceiling",
+            type=float,
+            default=0.07,
+            help="Hard aggregate cost ceiling in USD (default: 0.07)",
         )
         judge_parser.add_argument(
             "--force", action="store_true", help="Force re-judging existing evaluations"
@@ -529,7 +620,7 @@ def main(argv: list[str] | None = None) -> None:
         replay_parser.add_argument(
             "--real",
             action="store_true",
-            help="Execute against real Nebius API (disabled in step 2a)",
+            help="Execute against real Nebius Token Factory API",
         )
         replay_parser.add_argument(
             "--max-workers",

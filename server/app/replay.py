@@ -7,8 +7,6 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
-import httpx
-import openai
 from pydantic import BaseModel, Field
 from sqlmodel import Session, col, select
 from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
@@ -34,103 +32,6 @@ def _is_retryable_exception(exc: BaseException) -> bool:
     exc_name = type(exc).__name__.lower()
     target_names = ("ratelimit", "internalserver", "apiconnection", "timeout")
     return any(target in exc_name for target in target_names)
-
-
-LIVE_CLIENT_TYPES = (
-    openai.OpenAI,
-    openai.AsyncOpenAI,
-    httpx.Client,
-    httpx.AsyncClient,
-)
-
-
-def _contains_live_client(obj: Any, visited: set[int] | None = None) -> bool:
-    """Recursively inspect an object to detect if it wraps or contains a live network client."""
-    if obj is None:
-        return False
-    if visited is None:
-        visited = set()
-    obj_id = id(obj)
-    if obj_id in visited:
-        return False
-    visited.add(obj_id)
-
-    # 1. Direct type check against known network clients
-    if isinstance(obj, LIVE_CLIENT_TYPES):
-        return True
-
-    # 2. Check for network credentials/endpoints commonly used on OpenAI-compatible clients
-    if getattr(obj, "api_key", None) and (
-        getattr(obj, "base_url", None) or getattr(obj, "_base_url", None)
-    ):
-        return True
-
-    # 3. Recursively check object attributes in __slots__ across MRO
-    for cls in type(obj).__mro__:
-        slots = getattr(cls, "__slots__", None)
-        if slots:
-            if isinstance(slots, str):
-                slots = (slots,)
-            for slot in slots:
-                if hasattr(obj, slot):
-                    val = getattr(obj, slot)
-                    if _contains_live_client(val, visited):
-                        return True
-
-    # 4. Recursively check object attributes in __dict__
-    obj_dict = getattr(obj, "__dict__", None)
-    if isinstance(obj_dict, dict):
-        for val in obj_dict.values():
-            if _contains_live_client(val, visited):
-                return True
-
-    return False
-
-
-def _is_authorized_mock(client: Any) -> bool:
-    """Determine whether an object is explicitly an authorized in-memory test mock.
-
-    Follows default-deny security boundary: only recognized mock types and
-    mock test doubles are accepted as offline mocks. Setting attributes like
-    is_mock=True on an arbitrary client or wrapping a live client is rejected.
-    """
-    if client is None:
-        return True
-
-    # If the object directly is or contains a live client, it can NEVER be an authorized mock
-    if _contains_live_client(client):
-        return False
-
-    # Standard unittest/pytest mock doubles: verify genuine mock base classes
-    import unittest.mock
-
-    if isinstance(client, (unittest.mock.NonCallableMock, unittest.mock.Base)):
-        return True
-
-    # In-memory mock classes defined specifically for Downshift
-    if isinstance(client, MockReplayClient):
-        return True
-
-    try:
-        from server.app.judge import MockJudgeClient
-
-        if isinstance(client, MockJudgeClient):
-            return True
-    except ImportError:
-        pass
-
-    return False
-
-
-def _is_live_client(client: Any) -> bool:
-    """Check if client is a live or untrusted client requiring verified live pricing.
-
-    Default-deny principle: Any client that is not explicitly an authorized
-    offline in-memory mock is treated as a live client.
-    """
-    if client is None:
-        return False
-    return not _is_authorized_mock(client)
 
 
 def _execute_with_retry(
@@ -185,6 +86,47 @@ def resolve_tier_model(tier: str, session: Session) -> tuple[str, str]:
 
     real_id, _ = resolve_model_price(alias, session)
     return normalized_tier, real_id
+
+
+def estimate_input_tokens(request: dict[str, Any]) -> int:
+    """Conservatively estimate input tokens from serialized messages and tool definitions.
+
+    Uses character heuristics (~4 characters per token plus protocol framing overhead).
+    """
+    messages = request.get("messages", [])
+    approx_chars = 0
+    if isinstance(messages, list):
+        for m in messages:
+            if isinstance(m, dict):
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    approx_chars += len(c)
+                elif isinstance(c, list):
+                    for item in c:
+                        if isinstance(item, dict):
+                            approx_chars += len(str(item.get("text", "")))
+                        else:
+                            approx_chars += len(str(item))
+            elif isinstance(m, str):
+                approx_chars += len(m)
+
+    tools = request.get("tools")
+    if isinstance(tools, (list, tuple)):
+        for tool in tools:
+            try:
+                serialized_tool = _serialize_payload(tool)
+                approx_chars += len(json.dumps(serialized_tool))
+            except Exception:  # noqa: BLE001
+                approx_chars += len(str(tool))
+    elif tools is not None:
+        try:
+            serialized_tool = _serialize_payload(tools)
+            approx_chars += len(json.dumps(serialized_tool))
+        except Exception:  # noqa: BLE001
+            approx_chars += len(str(tools))
+
+    framing_tokens = 50 if (isinstance(messages, list) and messages) or tools else 0
+    return max(1, (approx_chars // 4) + framing_tokens)
 
 
 class _MockUsage(BaseModel):
@@ -352,26 +294,23 @@ def replay_run(
     retry_max_wait: float | None = None,
     retry_multiplier: float | None = None,
     retry_attempts: int | None = None,
-    execution_mode: str = "offline",
+    is_live: bool = False,
 ) -> list[Replay]:
-    """Replay recorded run steps across candidate tiers without using the recorder.
-
-    Supports explicit execution_mode ('offline' default, 'live' requires verified pricing).
-    """
+    """Replay recorded run steps across candidate tiers without using the recorder."""
     create_db_and_tables()
     sync_prices_from_yaml()
 
-    if client is not None and _is_live_client(client):
-        if execution_mode != "live":
-            raise RuntimeError(
-                f"REFUSAL: Cannot execute replay against live provider client: execution_mode is '{execution_mode}'. "
-                "Explicitly set execution_mode='live' and verify pricing in prices.yaml to authorize live inference."
-            )
-        is_verified, reason = db_mod.check_live_pricing_verified()
-        if not is_verified:
-            raise RuntimeError(
-                f"REFUSAL: Cannot execute replay against live provider client: {reason}"
-            )
+    is_live = is_live or (client is not None and type(client).__name__ == "OpenAI")
+
+    if client is None:
+        if is_live:
+            raise ValueError("A configured live client must be provided when is_live=True.")
+        client = MockReplayClient()
+
+    if is_live:
+        max_workers = 1
+        if retry_attempts is None:
+            retry_attempts = 1
 
     close_session = False
     if session is None:
@@ -392,6 +331,24 @@ def replay_run(
             return []
 
         resolved_tiers = [resolve_tier_model(t, session) for t in tiers]
+
+        if is_live:
+            # Persistent safety block: if any previous live attempt on this run encountered
+            # ambiguous billing / unreconciled costs, refuse further live replay until manual review.
+            unreconciled_existing = session.exec(
+                select(Replay)
+                .join(Step, col(Step.id) == col(Replay.step_id))
+                .where(
+                    Step.run_id == run_id,
+                    col(Replay.error).contains("UNRECONCILED_COST"),
+                )
+            ).all()
+            if unreconciled_existing:
+                affected = [f"step {r.step_id} tier {r.tier}" for r in unreconciled_existing]
+                raise RuntimeError(
+                    f"Live replay refused for run '{run_id}': run contains persistent unreconciled costs "
+                    f"from previous ambiguous failure ({', '.join(affected)}). Manual review required before further live requests."
+                )
 
         # Filter out steps already replayed for a tier unless force=True
         # Idempotent skip: only skip when existing replay has error IS NULL
@@ -416,35 +373,110 @@ def replay_run(
     if not tasks:
         return []
 
-    if client is None:
-        client = MockReplayClient()
-
     cumulative_cost = 0.0
     cost_lock = threading.Lock()
     replays_created: list[Replay] = []
     replays_lock = threading.Lock()
 
+    # Pre-call cost reservation and unreconciled usage tracking for live mode
+    reserved_cost = 0.0
+    cumulative_actual_cost = 0.0
+    has_unreconciled_cost = False
+    budget_lock = threading.Lock()
+
     def _execute_single(task: tuple[Step, str, str]) -> Replay:
-        nonlocal cumulative_cost
+        nonlocal cumulative_cost, reserved_cost, cumulative_actual_cost, has_unreconciled_cost
         step, norm_tier, model_id = task
 
-        # 1. Enforce cost ceiling before making the call
-        with cost_lock:
-            if cost_ceiling_usd is not None and cumulative_cost >= cost_ceiling_usd:
-                raise RuntimeError(
-                    f"Cost ceiling of ${cost_ceiling_usd:.6f} reached "
-                    f"(current: ${cumulative_cost:.6f}). Aborting replay."
+        reservation_made = False
+        reservation_reconciled = False
+        estimated_request_cost = 0.0
+
+        if is_live:
+            with budget_lock:
+                if has_unreconciled_cost:
+                    raise RuntimeError(
+                        f"Replay run '{run_id}' has unreconciled costs from a previous call (e.g. missing "
+                        f"usage metadata or ambiguous failure after dispatch). Further live requests are blocked to prevent untracked spend."
+                    )
+
+            if not isinstance(step.request, dict):
+                raise ValueError(
+                    f"Step {step.id} has invalid or missing request payload. Cannot replay."
                 )
 
-        # 2. Prepare call kwargs from stored Step.request, replacing ONLY model
-        call_kwargs = copy.deepcopy(step.request)
-        call_kwargs["model"] = model_id
-        # Ensure completion tokens are strictly bounded: clamp or set safe ceiling
-        stored_max_tokens = call_kwargs.get("max_tokens")
-        if stored_max_tokens is None or int(stored_max_tokens) <= 0:
-            call_kwargs["max_tokens"] = 600
+            call_kwargs = copy.deepcopy(step.request)
+            call_kwargs["model"] = model_id
+            call_kwargs.pop("downshift_tag", None)
+
+            max_tokens = call_kwargs.get("max_tokens")
+            if max_tokens is None:
+                max_tokens = call_kwargs.get("max_completion_tokens")
+
+            if max_tokens is None:
+                raise ValueError(
+                    f"Missing max_tokens in Step {step.id} request. "
+                    "A valid positive output-token limit is required before live dispatch."
+                )
+
+            try:
+                max_tokens_int = int(max_tokens)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"Invalid max_tokens value '{max_tokens}' in Step {step.id} request: must be an integer."
+                ) from exc
+
+            if max_tokens_int <= 0:
+                raise ValueError(
+                    f"Invalid max_tokens value {max_tokens_int} in Step {step.id} request: must be positive."
+                )
+
+            est_input_tokens = estimate_input_tokens(call_kwargs)
+
+            with Session(db_mod.engine) as s:
+                try:
+                    estimated_request_cost = calculate_cost(
+                        model_id, est_input_tokens, max_tokens_int, s
+                    )
+                except (ValueError, KeyError, FileNotFoundError) as exc:
+                    raise ValueError(
+                        f"Pricing resolution or cost calculation failed for candidate model '{model_id}': {exc}"
+                    ) from exc
+
+            with budget_lock:
+                if has_unreconciled_cost:
+                    raise RuntimeError(
+                        f"Replay run '{run_id}' has unreconciled costs from a previous call (e.g. missing "
+                        f"usage metadata or ambiguous failure after dispatch). Further live requests are blocked to prevent untracked spend."
+                    )
+                current_total = cumulative_actual_cost + reserved_cost
+                if cost_ceiling_usd is not None:
+                    if current_total >= cost_ceiling_usd:
+                        raise RuntimeError(
+                            f"Cost ceiling of ${cost_ceiling_usd:.6f} reached "
+                            f"(current: ${current_total:.6f}). Aborting live replay."
+                        )
+                    if (current_total + estimated_request_cost) > cost_ceiling_usd:
+                        raise RuntimeError(
+                            f"Cost ceiling of ${cost_ceiling_usd:.6f} reached: "
+                            f"current spent+reserved ${current_total:.6f} plus estimated request cost "
+                            f"${estimated_request_cost:.6f} exceeds budget of ${cost_ceiling_usd:.6f}. "
+                            "Aborting request before dispatch."
+                        )
+                reserved_cost += estimated_request_cost
+                reservation_made = True
         else:
-            call_kwargs["max_tokens"] = min(int(stored_max_tokens), 4096)
+            # 1. Enforce cost ceiling before making the call in mock mode
+            with cost_lock:
+                if cost_ceiling_usd is not None and cumulative_cost >= cost_ceiling_usd:
+                    raise RuntimeError(
+                        f"Cost ceiling of ${cost_ceiling_usd:.6f} reached "
+                        f"(current: ${cumulative_cost:.6f}). Aborting replay."
+                    )
+
+            # 2. Prepare call kwargs from stored Step.request, replacing ONLY model
+            call_kwargs = copy.deepcopy(step.request or {})
+            call_kwargs["model"] = model_id
 
         error_msg: str | None = None
         resp_data: dict[str, Any] | None = None
@@ -481,16 +513,17 @@ def replay_run(
                     prompt_tokens = getattr(usage, "prompt_tokens", None)
                     completion_tokens = getattr(usage, "completion_tokens", None)
 
-            if usage is None:
-                error_msg = "Response has no usage"
+            if usage is None or prompt_tokens is None or completion_tokens is None:
+                if usage is None:
+                    error_msg = "Response has no usage"
+                else:
+                    error_msg = "Response has no prompt_tokens or completion_tokens"
                 tokens_in = 0
                 tokens_out = 0
                 cost_usd = 0.0
-            elif prompt_tokens is None or completion_tokens is None:
-                error_msg = "Response has no prompt_tokens or completion_tokens"
-                tokens_in = 0
-                tokens_out = 0
-                cost_usd = 0.0
+                if is_live:
+                    with budget_lock:
+                        has_unreconciled_cost = True
             else:
                 tokens_in = int(prompt_tokens)
                 tokens_out = int(completion_tokens)
@@ -498,8 +531,14 @@ def replay_run(
                 with Session(db_mod.engine) as s:
                     cost_usd = calculate_cost(model_id, tokens_in, tokens_out, s)
 
-                with cost_lock:
-                    cumulative_cost += cost_usd
+                if is_live:
+                    with budget_lock:
+                        cumulative_actual_cost += cost_usd
+                        reserved_cost = max(0.0, reserved_cost - estimated_request_cost)
+                        reservation_reconciled = True
+                else:
+                    with cost_lock:
+                        cumulative_cost += cost_usd
 
             choices = (
                 raw_response.get("choices", [])
@@ -524,10 +563,23 @@ def replay_run(
             resp_data = _serialize_payload(raw_response)
         except Exception as exc:  # noqa: BLE001
             latency_ms = (time.perf_counter() - t0) * 1000.0
-            error_msg = f"{type(exc).__name__}: {exc}"
             tokens_in = 0
             tokens_out = 0
             cost_usd = 0.0
+            if is_live and reservation_made and not reservation_reconciled:
+                # Ambiguous billing: request was already dispatched and encountered an error
+                # (e.g. timeout, connection failure, or unexpected provider exception).
+                # Provider-side execution/billing is uncertain.
+                # Mark cost as unreconciled and DO NOT release the reservation so cumulative
+                # budget reflects the conservative upper bound and halts subsequent requests.
+                error_msg = (
+                    f"{type(exc).__name__}: {exc} [UNRECONCILED_COST: live request dispatched "
+                    f"but failed ambiguously; further live requests halted]"
+                )
+                with budget_lock:
+                    has_unreconciled_cost = True
+            else:
+                error_msg = f"{type(exc).__name__}: {exc}"
 
         # 3. Persist replay record
         with Session(db_mod.engine) as s:
@@ -565,22 +617,32 @@ def replay_run(
 
         return replay_row
 
-    # Execute tasks with ThreadPoolExecutor
-    from concurrent.futures import ThreadPoolExecutor
+    if is_live:
+        for task in tasks:
+            with budget_lock:
+                if has_unreconciled_cost:
+                    raise RuntimeError(
+                        f"Replay run '{run_id}' has unreconciled costs from a previous call (e.g. missing "
+                        f"usage metadata or ambiguous failure after dispatch). Further live requests are blocked to prevent untracked spend."
+                    )
+            _execute_single(task)
+    else:
+        # Execute tasks with ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor
 
-    worker_count = max(1, min(max_workers, len(tasks)))
-    executor_error: Exception | None = None
+        worker_count = max(1, min(max_workers, len(tasks)))
+        executor_error: Exception | None = None
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(_execute_single, t) for t in tasks]
-        for f in futures:
-            try:
-                f.result()
-            except Exception as err:  # noqa: BLE001
-                if executor_error is None:
-                    executor_error = err
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_execute_single, t) for t in tasks]
+            for f in futures:
+                try:
+                    f.result()
+                except Exception as err:  # noqa: BLE001
+                    if executor_error is None:
+                        executor_error = err
 
-    if executor_error is not None:
-        raise executor_error
+        if executor_error is not None:
+            raise executor_error
 
     return replays_created

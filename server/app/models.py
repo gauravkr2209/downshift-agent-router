@@ -115,6 +115,9 @@ class Evaluation(SQLModel, table=True):
     judge_score: float | None = Field(default=None, nullable=True)
     judge_reason: str | None = Field(default=None, nullable=True)
     judge_model: str | None = Field(default=None, nullable=True)
+    judge_tokens_in: int | None = Field(default=None, nullable=True)
+    judge_tokens_out: int | None = Field(default=None, nullable=True)
+    judge_cost_usd: float | None = Field(default=None, nullable=True)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     replay: Replay | None = Relationship(back_populates="evaluation")

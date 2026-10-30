@@ -503,25 +503,460 @@ def test_replay_tenacity_retry_on_429_5xx() -> None:
     assert call_count == 3
 
 
-def test_cli_replay_mock_and_real_refusal(capsys: pytest.CaptureFixture[str]) -> None:
-    """Test CLI replay in default mock mode and refusal when --real is passed."""
+def test_cli_replay_mock(capsys: pytest.CaptureFixture[str]) -> None:
+    """Test CLI replay in default mock mode works properly."""
     run_id = _create_sample_run(num_steps=1)
-
-    # 1. Test refusal with --real
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main(["replay", run_id, "--tiers", "super,nano", "--real"])
-    assert exc_info.value.code == 1
-    err = capsys.readouterr().err
-    assert (
-        "REFUSAL: Real API calls are disabled in Phase 2 Step 2a. Replays only run in mock mode."
-        in err
-    )
-
-    # 2. Test successful mock replay via CLI
     cli.main(["replay", run_id, "--tiers", "super,nano"])
     out = capsys.readouterr().out
     assert f"Downshift Replay Summary: Run {run_id}" in out
     assert "Total Replays Generated : 2" in out
+
+
+def test_cli_replay_real_constructs_client(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test that CLI replay with --real initializes OpenAI client with Nebius settings and passes to replay_run."""
+    run_id = _create_sample_run(num_steps=1)
+
+    monkeypatch.setattr(settings, "nebius_api_key", "test-live-key-12345")
+    monkeypatch.setattr(settings, "nebius_base_url", "https://api.tokenfactory.nebius.com/v1")
+    monkeypatch.setattr(settings, "nebius_request_timeout", 45.0)
+    monkeypatch.setattr(db_mod, "check_live_pricing_verified", lambda: (True, "Pricing verified"))
+
+    created_clients: list[Any] = []
+
+    class MockOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            created_clients.append(self)
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            return _MockResponse(
+                model=kwargs.get("model", "super"),
+                usage=_MockUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150),
+                choices=[_MockChoice(message=_MockMessage(content="Live mock content"))],
+            )
+
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", MockOpenAI)
+
+    cli.main(["replay", run_id, "--tiers", "super", "--real"])
+    out = capsys.readouterr().out
+    assert "(Mode: LIVE - Nebius Token Factory)" in out
+    assert len(created_clients) == 1
+    assert created_clients[0].kwargs["api_key"] == "test-live-key-12345"
+    assert created_clients[0].kwargs["base_url"] == "https://api.tokenfactory.nebius.com/v1"
+    assert created_clients[0].kwargs["timeout"] == 45.0
+    assert created_clients[0].kwargs["max_retries"] == 0
+
+
+def test_cli_replay_real_missing_credentials(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test that missing or placeholder Nebius credentials prevent client creation and exit."""
+    run_id = _create_sample_run(num_steps=1)
+
+    # 1. Missing API key
+    monkeypatch.setattr(settings, "nebius_api_key", None)
+    monkeypatch.setattr(settings, "nebius_base_url", "https://api.tokenfactory.nebius.com/v1")
+    monkeypatch.setattr(db_mod, "check_live_pricing_verified", lambda: (True, "Pricing verified"))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["replay", run_id, "--tiers", "super", "--real"])
+    assert exc_info.value.code == 1
+    assert "REFUSAL: NEBIUS_API_KEY is not configured in .env." in capsys.readouterr().err
+
+    # 2. Placeholder API key
+    monkeypatch.setattr(settings, "nebius_api_key", "PLACEHOLDER_KEY")
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["replay", run_id, "--tiers", "super", "--real"])
+    assert exc_info.value.code == 1
+    assert "REFUSAL: NEBIUS_API_KEY is not configured in .env." in capsys.readouterr().err
+
+    # 3. Missing Base URL
+    monkeypatch.setattr(settings, "nebius_api_key", "valid-key")
+    monkeypatch.setattr(settings, "nebius_base_url", None)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["replay", run_id, "--tiers", "super", "--real"])
+    assert exc_info.value.code == 1
+    assert "REFUSAL: NEBIUS_BASE_URL is not configured in .env." in capsys.readouterr().err
+
+
+def test_cli_replay_real_unverified_pricing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test that unverified pricing prevents live replay."""
+    run_id = _create_sample_run(num_steps=1)
+    monkeypatch.setattr(settings, "nebius_api_key", "valid-key")
+    monkeypatch.setattr(settings, "nebius_base_url", "https://api.tokenfactory.nebius.com/v1")
+    monkeypatch.setattr(
+        db_mod,
+        "check_live_pricing_verified",
+        lambda: (False, "prices.yaml has verified_for_live=false (or unset/not boolean True)."),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["replay", run_id, "--tiers", "super", "--real"])
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "REFUSAL: prices.yaml has verified_for_live=false" in err
+
+
+def test_live_replay_invalid_or_missing_max_tokens_prevents_dispatch() -> None:
+    """Test that missing or invalid max_tokens in step request raises ValueError before dispatch."""
+    with Session(db_mod.engine) as session:
+        run_record = Run(
+            task_name="test_tokens",
+            agent_name="test_agent",
+            baseline_model="nvidia/Nemotron-3-Ultra-550b-a55b",
+            status="completed",
+        )
+        session.add(run_record)
+        session.commit()
+        session.refresh(run_record)
+        run_id = str(run_record.id)
+
+        # Step with missing max_tokens
+        step_missing = Step(
+            run_id=run_id,
+            idx=0,
+            tag="tag_0",
+            kind="text",
+            model="nvidia/Nemotron-3-Ultra-550b-a55b",
+            request={"messages": [{"role": "user", "content": "Hello"}]},
+            tokens_in=10,
+            tokens_out=10,
+            cost_usd=0.0001,
+        )
+        session.add(step_missing)
+        session.commit()
+        session.refresh(step_missing)
+        step_id = str(step_missing.id)
+
+    called = False
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            nonlocal called
+            called = True
+            return _MockResponse(model="super")
+
+    client = DummyClient()
+
+    # 1. Missing max_tokens
+    with pytest.raises(ValueError, match="Missing max_tokens in Step"):
+        replay_run(run_id=run_id, tiers=["super"], client=client, is_live=True)
+    assert not called
+
+    # 2. Non-positive max_tokens
+    with Session(db_mod.engine) as session:
+        step_db = session.get(Step, step_id)
+        assert step_db is not None
+        step_db.request = {"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 0}
+        session.add(step_db)
+        session.commit()
+
+    with pytest.raises(ValueError, match="must be positive"):
+        replay_run(run_id=run_id, tiers=["super"], client=client, is_live=True)
+    assert not called
+
+
+def test_live_replay_cost_reservation_blocks_before_dispatch() -> None:
+    """Test that estimated cost exceeding budget ceiling raises RuntimeError before dispatch."""
+    run_id = _create_sample_run(num_steps=1)
+    called = False
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            nonlocal called
+            called = True
+            return _MockResponse(model="super")
+
+    client = DummyClient()
+
+    # Step has max_tokens=1500. For Super ($0.30 in / $0.90 out per Mtok),
+    # 1500 completion tokens alone cost 1500 * 0.90 / 1e6 = $0.00135.
+    # Setting cost_ceiling_usd = 0.0001 guarantees reservation exceeds ceiling.
+    with pytest.raises(RuntimeError, match=r"Cost ceiling of \$0\.000100 reached"):
+        replay_run(
+            run_id=run_id,
+            tiers=["super"],
+            client=client,
+            cost_ceiling_usd=0.0001,
+            is_live=True,
+        )
+
+    assert not called
+
+
+def test_live_replay_no_additional_requests_after_budget_exhaustion() -> None:
+    """Test that after a request exhausts budget, no subsequent live requests are dispatched."""
+    run_id = _create_sample_run(num_steps=2)
+    dispatch_count = 0
+
+    class CountingClient:
+        def __init__(self) -> None:
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            nonlocal dispatch_count
+            dispatch_count += 1
+            # Step 1 usage costs 1000 * 0.30/1e6 + 500 * 0.90/1e6 = 0.000300 + 0.000450 = 0.000750 USD
+            return _MockResponse(
+                model=kwargs.get("model", "super"),
+                usage=_MockUsage(prompt_tokens=1000, completion_tokens=500, total_tokens=1500),
+                choices=[_MockChoice(message=_MockMessage(content="Response 1"))],
+            )
+
+    client = CountingClient()
+
+    # Set ceiling such that step 0 succeeds (actual cost ~$0.00075), but step 1 prospective cost (~$0.0014)
+    # plus actual cost ($0.00075) = $0.00215 exceeds ceiling of $0.00150.
+    with pytest.raises(RuntimeError, match=r"Cost ceiling"):
+        replay_run(
+            run_id=run_id,
+            tiers=["super"],
+            client=client,
+            cost_ceiling_usd=0.0015,
+            is_live=True,
+        )
+
+    # Step 0 dispatched and completed; Step 1 was blocked before dispatch
+    assert dispatch_count == 1
+
+
+def test_live_replay_missing_usage_metadata_blocks_subsequent_requests() -> None:
+    """Test that missing usage metadata in response blocks subsequent live requests."""
+    run_id = _create_sample_run(num_steps=2)
+    dispatch_count = 0
+
+    class NoUsageClient:
+        def __init__(self) -> None:
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            nonlocal dispatch_count
+            dispatch_count += 1
+            # First call returns response with usage=None
+            return _MockResponse(
+                model=kwargs.get("model", "super"),
+                usage=None,
+                choices=[_MockChoice(message=_MockMessage(content="No usage"))],
+            )
+
+    client = NoUsageClient()
+
+    with pytest.raises(RuntimeError, match=r"unreconciled costs"):
+        replay_run(
+            run_id=run_id,
+            tiers=["super"],
+            client=client,
+            is_live=True,
+        )
+
+    # Step 0 dispatched, returned no usage; Step 1 was blocked before dispatch
+    assert dispatch_count == 1
+
+    # Verify Step 0 replay record was stored with error indicating missing usage
+    with Session(db_mod.engine) as session:
+        replays = session.exec(select(Replay).where(Replay.tier == "super")).all()
+        assert any(r.error == "Response has no usage" for r in replays)
+
+
+def test_live_replay_reservation_reconciliation_and_ambiguous_failure_halt() -> None:
+    """Test that reservations are reconciled to actual cost on success, and ambiguous failures halt subsequent requests."""
+    run_id = _create_sample_run(num_steps=2)
+    dispatch_count = 0
+
+    class ReconcilingClient:
+        def __init__(self) -> None:
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            nonlocal dispatch_count
+            dispatch_count += 1
+            if dispatch_count == 1:
+                # Actual cost is very small: 10 tokens in / 10 tokens out = ~$0.000012
+                return _MockResponse(
+                    model=kwargs.get("model", "super"),
+                    usage=_MockUsage(prompt_tokens=10, completion_tokens=10, total_tokens=20),
+                    choices=[_MockChoice(message=_MockMessage(content="Small usage"))],
+                )
+            return _MockResponse(
+                model=kwargs.get("model", "super"),
+                usage=_MockUsage(prompt_tokens=10, completion_tokens=10, total_tokens=20),
+                choices=[_MockChoice(message=_MockMessage(content="Second call"))],
+            )
+
+    client = ReconcilingClient()
+
+    replays = replay_run(
+        run_id=run_id,
+        tiers=["super"],
+        client=client,
+        cost_ceiling_usd=0.0030,
+        is_live=True,
+    )
+    assert len(replays) == 2
+    assert dispatch_count == 2
+    assert all(r.error is None for r in replays)
+
+    # Now test ambiguous billing failure on exception:
+    run_id_fail = _create_sample_run(num_steps=2)
+    failing_dispatch_count = 0
+
+    class FailingClient:
+        def __init__(self) -> None:
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            nonlocal failing_dispatch_count
+            failing_dispatch_count += 1
+            raise RuntimeError("Provider connection reset")
+
+    with pytest.raises(RuntimeError, match=r"unreconciled costs"):
+        replay_run(
+            run_id=run_id_fail,
+            tiers=["super"],
+            client=FailingClient(),
+            cost_ceiling_usd=0.0030,
+            is_live=True,
+        )
+
+    # Step 0 was dispatched and failed ambiguously; Step 1 was halted before dispatch
+    assert failing_dispatch_count == 1
+
+    # Verify Step 0 replay record was stored with UNRECONCILED_COST error
+    with Session(db_mod.engine) as session:
+        step_0 = session.exec(select(Step).where(Step.run_id == run_id_fail, Step.idx == 0)).first()
+        assert step_0 is not None
+        replays_failed = session.exec(
+            select(Replay).where(Replay.step_id == step_0.id, Replay.tier == "super")
+        ).all()
+        assert len(replays_failed) == 1
+        assert "UNRECONCILED_COST" in str(replays_failed[0].error)
+        assert "Provider connection reset" in str(replays_failed[0].error)
+
+        step_1 = session.exec(select(Step).where(Step.run_id == run_id_fail, Step.idx == 1)).first()
+        assert step_1 is not None
+        step_1_replays = session.exec(
+            select(Replay).where(Replay.step_id == step_1.id, Replay.tier == "super")
+        ).all()
+        assert len(step_1_replays) == 0
+
+
+def test_persistent_safety_block_prevents_retry_after_ambiguous_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test that a run with persistent UNRECONCILED_COST cannot be retried in live mode across invocations."""
+    run_id = _create_sample_run(num_steps=1)
+
+    # 1. First invocation: ambiguous failure during live request
+    class AmbiguousFailClient:
+        def __init__(self) -> None:
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            raise RuntimeError("Connection dropped during flight")
+
+    # Incur the ambiguous failure on run_id
+    replays = replay_run(
+        run_id=run_id,
+        tiers=["super"],
+        client=AmbiguousFailClient(),
+        is_live=True,
+    )
+    assert len(replays) == 1
+    assert "UNRECONCILED_COST" in str(replays[0].error)
+
+    # 2. Second invocation: attempt to replay the same run_id and tier in live mode
+    second_dispatch_count = 0
+
+    class SecondClient:
+        def __init__(self) -> None:
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            nonlocal second_dispatch_count
+            second_dispatch_count += 1
+            return _MockResponse(model="super")
+
+    client2 = SecondClient()
+
+    # Second invocation without force must fail and block dispatch
+    with pytest.raises(RuntimeError, match=r"persistent unreconciled costs"):
+        replay_run(
+            run_id=run_id,
+            tiers=["super"],
+            client=client2,
+            is_live=True,
+        )
+    assert second_dispatch_count == 0
+
+    # Second invocation WITH force must ALSO fail and block dispatch
+    with pytest.raises(RuntimeError, match=r"persistent unreconciled costs"):
+        replay_run(
+            run_id=run_id,
+            tiers=["super"],
+            client=client2,
+            force=True,
+            is_live=True,
+        )
+    assert second_dispatch_count == 0
+
+    # 3. CLI test: launch separate CLI replay invocation in live mode against same run_id
+    monkeypatch.setattr(settings, "nebius_api_key", "valid-key")
+    monkeypatch.setattr(settings, "nebius_base_url", "https://api.tokenfactory.nebius.com/v1")
+    monkeypatch.setattr(db_mod, "check_live_pricing_verified", lambda: (True, "Pricing verified"))
+    monkeypatch.setattr(db_mod, "sync_prices_from_yaml", lambda: None)
+
+    class MockOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            nonlocal second_dispatch_count
+            second_dispatch_count += 1
+            return _MockResponse(model="super")
+
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", MockOpenAI)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["replay", run_id, "--tiers", "super", "--real"])
+    assert exc_info.value.code == 1
+    assert "persistent unreconciled costs" in capsys.readouterr().err
+    assert second_dispatch_count == 0
+
+    # 4. Verify existing mock replay behavior is preserved
+    mock_client = MockReplayClient()
+    mock_replays = replay_run(
+        run_id=run_id,
+        tiers=["super"],
+        client=mock_client,
+        is_live=False,
+    )
+    assert len(mock_replays) == 1
+    assert mock_replays[0].error is None
 
 
 def test_retrying_failed_step_tier_deletes_old_replay_and_evaluation() -> None:
@@ -670,212 +1105,3 @@ def test_sqlite_wal_and_busy_timeout_concurrent_replays() -> None:
     with Session(db_mod.engine) as session:
         stored_replays = session.exec(select(Replay).join(Step).where(Step.run_id == run_id)).all()
         assert len(stored_replays) == 20
-
-
-def test_replay_run_refuses_live_client_when_pricing_unverified() -> None:
-    """Replay run refuses to execute when passed a live OpenAI client and pricing is unverified."""
-    from openai import OpenAI
-
-    live_client = OpenAI(api_key="mock-test-key", base_url="https://api.mock.nebius/v1")
-    run_id = _create_sample_run(num_steps=1)
-
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=live_client)
-
-
-def test_replay_run_refuses_adversarial_client_types_when_pricing_unverified() -> None:
-    """Replay run refuses execution for subclassed, proxied, or mock-wrapped live clients."""
-    from openai import OpenAI
-
-    run_id = _create_sample_run(num_steps=1)
-
-    # 1. Subclass of OpenAI
-    class SubclassOpenAI(OpenAI):
-        pass
-
-    sub_client = SubclassOpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=sub_client)
-
-    # 2. Proxy client that wraps OpenAI
-    class ProxyClient:
-        def __init__(self) -> None:
-            self.client = OpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-            self.chat = self.client.chat
-
-    proxy_client = ProxyClient()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=proxy_client)
-
-    # 3. Mock class name that maliciously wraps an actual live client
-    class MockTrojanWrapper:
-        def __init__(self) -> None:
-            self.client = OpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-            self.chat = self.client.chat
-
-    trojan_client = MockTrojanWrapper()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=trojan_client)
-
-    # 4. Third-party duck-typed client
-    class ThirdPartyOpenAICompatible:
-        def __init__(self) -> None:
-            self.chat = self
-            self.completions = self
-
-        def create(self, **_kwargs: Any) -> Any:
-            raise NotImplementedError("Live call")
-
-    third_party_client = ThirdPartyOpenAICompatible()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=third_party_client)
-
-    # 5. Setting is_mock=True on a live OpenAI client cannot bypass the gate
-    tricky_client = OpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-    tricky_client.is_mock = True  # type: ignore[attr-defined]
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=tricky_client)
-
-    # 6. Subclassing MockReplayClient while wrapping an inner live client cannot bypass the gate
-    class SneakySubclassMock(MockReplayClient):
-        def __init__(self) -> None:
-            super().__init__()
-            self.hidden_real_handle = OpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-
-    sneaky_client = SneakySubclassMock()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=sneaky_client)
-
-    # 7. Slotted proxy hiding a live OpenAI client cannot bypass the gate
-    class SlottedReplayProxy:
-        __slots__ = ("_hidden_client",)
-
-        def __init__(self) -> None:
-            self._hidden_client = OpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-
-    slotted_client = SlottedReplayProxy()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=slotted_client)
-
-    # 8. Spoofing _mock_self or _mock_return_value attributes cannot bypass the gate
-    class SpoofedMockAttributeReplayClient:
-        def __init__(self) -> None:
-            self._mock_self = True
-
-    spoofed_attr_client = SpoofedMockAttributeReplayClient()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=spoofed_attr_client)
-
-    # 9. Spoofing __name__ and __module__ as MockReplayClient cannot bypass the gate
-    class SpoofedReplayIdentityClient:
-        pass
-
-    SpoofedReplayIdentityClient.__name__ = "MockReplayClient"
-    SpoofedReplayIdentityClient.__module__ = "server.app.replay"
-    spoofed_replay_client = SpoofedReplayIdentityClient()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute replay against live provider client"
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=spoofed_replay_client)
-
-    # 10. Verify execution_mode gate refusal when execution_mode is offline (default)
-    with pytest.raises(RuntimeError, match="execution_mode is 'offline'"):
-        replay_run(run_id=run_id, tiers=["super"], client=sub_client, execution_mode="offline")
-
-    # 11. Verify execution_mode="live" still refuses when live pricing is unverified
-    with pytest.raises(
-        RuntimeError,
-        match="REFUSAL: Cannot execute replay against live provider client: prices.yaml has verified_for_live=false",
-    ):
-        replay_run(run_id=run_id, tiers=["super"], client=sub_client, execution_mode="live")
-
-
-def test_replay_run_clamps_max_tokens() -> None:
-    """Replay run ensures max_tokens is bounded: defaults to 600 if missing, clamps if oversized."""
-    captured_kwargs: list[dict[str, Any]] = []
-
-    def mock_create(kwargs: dict[str, Any]) -> _MockResponse:
-        captured_kwargs.append(copy.deepcopy(kwargs))
-        return _MockResponse(
-            model=kwargs["model"],
-            usage=_MockUsage(prompt_tokens=10, completion_tokens=10, total_tokens=20),
-            choices=[
-                _MockChoice(
-                    message=_MockMessage(role="assistant", content="Replayed text"),
-                    finish_reason="stop",
-                )
-            ],
-        )
-
-    import copy
-
-    # Step 1 has no max_tokens; Step 2 has max_tokens=10000 (oversized)
-    with Session(db_mod.engine) as session:
-        run_record = Run(
-            task_name="clamp_test",
-            agent_name="agent_clamp",
-            baseline_model="nvidia/Nemotron-3-Ultra-550b-a55b",
-            status="completed",
-        )
-        session.add(run_record)
-        session.commit()
-        session.refresh(run_record)
-
-        s1 = Step(
-            run_id=run_record.id,
-            idx=0,
-            tag="plan",
-            kind="text",
-            model="nvidia/Nemotron-3-Ultra-550b-a55b",
-            request={"model": "nvidia/Nemotron-3-Ultra-550b-a55b", "messages": []},
-            tokens_in=10,
-            tokens_out=10,
-            cost_usd=0.0001,
-        )
-        s2 = Step(
-            run_id=run_record.id,
-            idx=1,
-            tag="synthesis",
-            kind="text",
-            model="nvidia/Nemotron-3-Ultra-550b-a55b",
-            request={
-                "model": "nvidia/Nemotron-3-Ultra-550b-a55b",
-                "messages": [],
-                "max_tokens": 10000,
-            },
-            tokens_in=10,
-            tokens_out=10,
-            cost_usd=0.0001,
-        )
-        session.add_all([s1, s2])
-        session.commit()
-        run_id = run_record.id
-
-    client = MockReplayClient(tier_behaviors={"super": mock_create})
-    replays = replay_run(run_id=run_id, tiers=["super"], client=client, force=True)
-    assert len(replays) == 2
-    assert all(r.error is None for r in replays)
-
-    assert len(captured_kwargs) == 2
-    # First step had no max_tokens -> defaulted to 600
-    assert captured_kwargs[0]["max_tokens"] == 600
-    # Second step had 10000 -> clamped to 4096
-    assert captured_kwargs[1]["max_tokens"] == 4096

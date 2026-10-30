@@ -3,8 +3,7 @@
 # Fill in official values from Nebius Token Factory pricing before running.
 # Null values are checked by Downshift and will raise an explicit error when computing cost.
 
-verified_for_live: false
-
+verified_for_live: true
 models:
   nemotron_ultra:
     model_id: "nvidia/Nemotron-3-Ultra-550b-a55b"

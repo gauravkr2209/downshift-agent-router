@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, SQLModel, col, create_engine, func, or_, select
 
 from server.app.config import REPO_ROOT, settings
@@ -42,8 +43,22 @@ configure_sqlite_engine(engine)
 
 
 def create_db_and_tables() -> None:
-    """Create all configured database tables."""
+    """Create all configured database tables and migrate missing columns."""
     SQLModel.metadata.create_all(engine)
+    with engine.begin() as conn:
+        try:
+            res = conn.execute(text("PRAGMA table_info(evaluations);")).fetchall()
+            existing_cols = {r[1] for r in res}
+            for col_name, col_type in [
+                ("judge_tokens_in", "INTEGER"),
+                ("judge_tokens_out", "INTEGER"),
+                ("judge_cost_usd", "FLOAT"),
+            ]:
+                if col_name not in existing_cols:
+                    conn.execute(text(f"ALTER TABLE evaluations ADD COLUMN {col_name} {col_type};"))
+        except OperationalError:
+            # Table might not exist yet or columns already exist
+            pass
 
 
 def get_session() -> Generator[Session, None, None]:

@@ -1,5 +1,6 @@
 """Tests for Phase 2c LLM-based replay quality judging, bias controls, and CLI."""
 
+import json
 from typing import Any
 
 import pytest
@@ -8,10 +9,15 @@ from sqlmodel import Session, select
 from server.app import cli
 from server.app import db as db_mod
 from server.app.checks import evaluate_replay
+from server.app.config import settings
 from server.app.db import create_db_and_tables
 from server.app.judge import (
     MockJudgeClient,
     _build_judge_prompt,
+    _MockJudgeChoice,
+    _MockJudgeMessage,
+    _MockJudgeResponse,
+    _MockJudgeUsage,
     _objective_checks_have_run,
     judge_replay,
     judge_run,
@@ -576,20 +582,79 @@ def test_judge_run_idempotency() -> None:
         assert count_second == 2
 
 
-# 13. Test: CLI judge command and refusal
-def test_cli_judge_mock_and_real_refusal(capsys: pytest.CaptureFixture[str]) -> None:
-    """Test CLI judge command in default mock mode and refusal when --real is passed."""
+# 13. Test: CLI judge command, credential checks, and mock mode
+def test_cli_judge_mock_and_real_safeguards(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test CLI judge command in default mock mode and safeguard refusals when --real is passed."""
     run_id, step_id = _create_sample_run_with_step(kind="text")
     _create_sample_replay(step_id, tier="super")
 
-    # 1. Refusal with --real
+    # 1. Refusal with missing/placeholder API key
+    monkeypatch.setattr(settings, "nebius_api_key", "your_api_key_here")
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["judge", run_id, "--real"])
     assert exc_info.value.code == 1
-    err = capsys.readouterr().err
-    assert "REFUSAL: Real API calls are disabled in Phase 2c." in err
+    assert "REFUSAL: NEBIUS_API_KEY is not configured in .env." in capsys.readouterr().err
 
-    # 2. Successful mock judge via CLI
+    # 2. Refusal with missing base URL
+    monkeypatch.setattr(settings, "nebius_api_key", "valid-key-123")
+    monkeypatch.setattr(settings, "nebius_base_url", None)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["judge", run_id, "--real"])
+    assert exc_info.value.code == 1
+    assert "REFUSAL: NEBIUS_BASE_URL is not configured in .env." in capsys.readouterr().err
+
+    # 3. Refusal with unverified pricing
+    monkeypatch.setattr(settings, "nebius_base_url", "https://api.tokenfactory.nebius.com/v1")
+    monkeypatch.setattr(
+        db_mod,
+        "check_live_pricing_verified",
+        lambda: (False, "prices.yaml has verified_for_live=false (or unset/not boolean True)."),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["judge", run_id, "--real"])
+    assert exc_info.value.code == 1
+    assert "REFUSAL: prices.yaml has verified_for_live=false" in capsys.readouterr().err
+
+    # 4. Successful client construction when credentials and pricing verified
+    monkeypatch.setattr(db_mod, "check_live_pricing_verified", lambda: (True, "Pricing verified"))
+    monkeypatch.setattr(db_mod, "sync_prices_from_yaml", lambda: None)
+
+    created_clients: list[Any] = []
+
+    class MockOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            created_clients.append(self)
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs: Any) -> Any:
+            resp_payload = {
+                "score": 0.90,
+                "verdict": "pass",
+                "reason": "Accurate candidate output.",
+            }
+            return _MockJudgeResponse(
+                choices=[
+                    _MockJudgeChoice(message=_MockJudgeMessage(content=json.dumps(resp_payload)))
+                ]
+            )
+
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", MockOpenAI)
+
+    cli.main(["judge", run_id, "--real"])
+    out = capsys.readouterr().out
+    assert "(Mode: LIVE - Nebius Token Factory Judge)" in out
+    assert len(created_clients) == 1
+    assert created_clients[0].kwargs["api_key"] == "valid-key-123"
+    assert created_clients[0].kwargs["base_url"] == "https://api.tokenfactory.nebius.com/v1"
+    assert created_clients[0].kwargs["max_retries"] == 0
+
+    # 5. Default mock judge via CLI
     cli.main(["judge", run_id])
     out = capsys.readouterr().out
     assert f"Downshift Replay Quality Report: Run {run_id}" in out
@@ -600,138 +665,584 @@ def test_cli_judge_mock_and_real_refusal(capsys: pytest.CaptureFixture[str]) -> 
     assert "Total Evaluations Judged" in out
 
 
-def test_judge_replay_refuses_live_client_when_pricing_unverified() -> None:
-    """judge_replay refuses execution if passed a live OpenAI client when live pricing is unverified."""
-    from openai import OpenAI
+# 14. Test: Anti-length bias and concise accurate answers
+def test_judge_anti_length_bias_evaluates_concise_response() -> None:
+    """Concise responses capturing essential facts receive high scores without length penalty."""
+    _run_id, step_id = _create_sample_run_with_step(
+        kind="text",
+        content=(
+            "The architecture of NVIDIA Nemotron 3.5 Super VL utilizes 512 routed "
+            "experts with 120B total parameters and 12B active parameters. It includes "
+            "a C-RADIO vision encoder and supports up to 1M context tokens."
+        ),
+    )
+    replay = _create_sample_replay(
+        step_id,
+        tier="super",
+        content=(
+            "Nemotron 3.5 Super VL: 120B total / 12B active parameters, 512 MoE experts, "
+            "C-RADIO encoder, 1M context."
+        ),
+    )
 
-    _run_id, step_id = _create_sample_run_with_step(kind="text")
-    replay = _create_sample_replay(step_id, tier="super")
+    client = MockJudgeClient(
+        default_score=0.92,
+        default_verdict="pass",
+        default_reason="Concise answer directly preserves all key technical facts without fluff.",
+    )
 
+    eval_rec = judge_replay(step=session_step(step_id), replay=replay, client=client)
+    assert eval_rec.judge_score == 0.92
+    assert "[PASS]" in str(eval_rec.judge_reason)
+    assert "without fluff" in str(eval_rec.judge_reason)
+
+
+# 15. Test: Hallucination detection penalization
+def test_judge_penalizes_hallucinations() -> None:
+    """Candidates introducing fabricated entities or claims are penalized with fail verdict."""
+    _run_id, step_id = _create_sample_run_with_step(
+        kind="text",
+        content="Nebius Token Factory hosts three models: Nemotron 3.5 Super VL.",
+    )
+    replay = _create_sample_replay(
+        step_id,
+        tier="nano",
+        content="Nebius Token Factory hosts GPT-5 Turbo and Claude 4 Opus with 2M tokens.",
+    )
+
+    client = MockJudgeClient(
+        scenario_handlers={
+            "GPT-5": {
+                "score": 0.10,
+                "verdict": "fail",
+                "reason": "Critical hallucination: candidate fabricated unhosted third-party models.",
+            }
+        }
+    )
+
+    eval_rec = judge_replay(step=session_step(step_id), replay=replay, client=client)
+    assert eval_rec.judge_score == 0.10
+    assert "[FAIL]" in str(eval_rec.judge_reason)
+    assert "Critical hallucination" in str(eval_rec.judge_reason)
+
+
+# 16. Test: Critical factual omission penalization
+def test_judge_penalizes_critical_factual_omissions() -> None:
+    """Candidates omitting vital conclusions or required parameters receive fail verdict."""
+    _run_id, step_id = _create_sample_run_with_step(
+        kind="text",
+        content="The model has 120B total parameters and 12B active parameters with 512 experts.",
+    )
+    replay = _create_sample_replay(
+        step_id,
+        tier="nano",
+        content="The model is an AI model from NVIDIA.",
+    )
+
+    client = MockJudgeClient(
+        scenario_handlers={
+            "AI model from NVIDIA": {
+                "score": 0.35,
+                "verdict": "fail",
+                "reason": "Major factual omission: failed to report parameter counts and expert specifications.",
+            }
+        }
+    )
+
+    eval_rec = judge_replay(step=session_step(step_id), replay=replay, client=client)
+    assert eval_rec.judge_score == 0.35
+    assert "[FAIL]" in str(eval_rec.judge_reason)
+    assert "Major factual omission" in str(eval_rec.judge_reason)
+
+
+# 17. Test: Task and step context preserved in judge prompt
+def test_judge_prompt_includes_task_and_step_context() -> None:
+    """Judge prompt includes both overall task prompt and immediate step instruction."""
     with Session(db_mod.engine) as session:
-        step = session.get(Step, step_id)
-        assert step is not None
+        run = Run(
+            task_name="context_test",
+            agent_name="agent_test",
+            baseline_model="nvidia/Nemotron-3-Ultra-550b-a55b",
+            status="completed",
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
 
-    live_client = OpenAI(api_key="mock-key", base_url="https://api.mock.nebius/v1")
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_replay(step=step, replay=replay, client=live_client)
+        step = Step(
+            run_id=run.id,
+            idx=0,
+            tag="final_answer",
+            kind="text",
+            model="nvidia/Nemotron-3-Ultra-550b-a55b",
+            request={
+                "messages": [
+                    {"role": "system", "content": "You are a research agent."},
+                    {
+                        "role": "user",
+                        "content": "Overall research question: What models are on Nebius?",
+                    },
+                    {"role": "assistant", "content": "Interim search queries conducted."},
+                    {
+                        "role": "user",
+                        "content": "Synthesize the final answer based on all findings.",
+                    },
+                ]
+            },
+            response={"choices": [{"message": {"content": "Final baseline report."}}]},
+        )
+        session.add(step)
+        session.commit()
+        session.refresh(step)
+
+        replay = Replay(
+            step_id=step.id,
+            tier="super",
+            model="nvidia/nemotron-3-super-120b-a12b",
+            mode="step_level",
+            response={"choices": [{"message": {"content": "Final candidate report."}}]},
+        )
+        session.add(replay)
+        session.commit()
+        session.refresh(replay)
+
+        prompt = _build_judge_prompt(step, replay)
+
+    user_msg = prompt[1]["content"]
+
+    assert "Overall research question: What models are on Nebius?" in user_msg
+    assert "Synthesize the final answer based on all findings." in user_msg
+    assert "Anti-Length Bias Rule" in prompt[0]["content"]
+    assert "Factual Consistency & Hallucination Detection" in prompt[0]["content"]
 
 
-def test_judge_run_and_replay_refuses_adversarial_client_types_when_pricing_unverified() -> None:
-    """judge_run and judge_replay refuse execution for live, subclassed, or proxied clients."""
-    from openai import OpenAI
-
+# 18. Test: Do not silently overwrite existing evaluation results without force
+def test_judge_preserves_existing_evaluations_without_force() -> None:
+    """Judge does not silently overwrite existing evaluation results unless force=True."""
     run_id, step_id = _create_sample_run_with_step(kind="text")
-    replay = _create_sample_replay(step_id, tier="super")
+    _create_sample_replay(step_id, tier="super")
 
+    client_initial = MockJudgeClient(
+        default_score=0.88, default_verdict="pass", default_reason="Original score."
+    )
+    evals1 = judge_run(run_id=run_id, client=client_initial, force=False)
+    assert len(evals1) == 1
+    assert evals1[0].judge_score == 0.88
+    assert "Original score." in str(evals1[0].judge_reason)
+
+    # Second invocation with a different client score but force=False: must keep original
+    client_overwrite = MockJudgeClient(
+        default_score=0.20, default_verdict="fail", default_reason="New failing score."
+    )
+    evals2 = judge_run(run_id=run_id, client=client_overwrite, force=False)
+    assert len(evals2) == 1
+    assert evals2[0].judge_score == 0.88
+    assert "Original score." in str(evals2[0].judge_reason)
+
+    # Third invocation with force=True: updates evaluation
+    evals3 = judge_run(run_id=run_id, client=client_overwrite, force=True)
+    assert len(evals3) == 1
+    assert evals3[0].judge_score == 0.20
+    assert "New failing score." in str(evals3[0].judge_reason)
+
+
+# Helper for session step loading in tests
+def session_step(step_id: str) -> Step:
     with Session(db_mod.engine) as session:
         step = session.get(Step, step_id)
         assert step is not None
+        return step
 
-    class CustomSubclassOpenAI(OpenAI):
-        pass
 
-    class ProxyClient:
-        def __init__(self) -> None:
-            self.client = OpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-            self.chat = self.client.chat
+# 19. Test: Ambiguous failure halts subsequent calls
+def test_judge_live_ambiguous_failure_halts_subsequent_calls() -> None:
+    """Live judge request encountering ambiguous failure (e.g. timeout) tags unreconciled cost and halts subsequent calls."""
+    run_id, step1_id = _create_sample_run_with_step(kind="text", tag="step_1")
+    with Session(db_mod.engine) as session:
+        step2 = Step(
+            run_id=run_id,
+            idx=1,
+            tag="step_2",
+            kind="text",
+            model="nvidia/Nemotron-3-Ultra-550b-a55b",
+            response={"choices": [{"message": {"content": "Step 2 baseline."}}]},
+        )
+        session.add(step2)
+        session.commit()
+        session.refresh(step2)
+        step2_id = step2.id
 
-    sub_client = CustomSubclassOpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-    proxy_client = ProxyClient()
+    rep1 = _create_sample_replay(step1_id, tier="super", content="Candidate 1")
+    rep2 = _create_sample_replay(step2_id, tier="super", content="Candidate 2")
 
-    # judge_run refuses live subclass client upfront
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_run(run_id=run_id, client=sub_client)
+    class FailingJudgeClient:
+        class _Chat:
+            def __init__(self, client: "FailingJudgeClient") -> None:
+                self.client = client
+                self.completions = self._Completions(client)
 
-    # judge_run refuses proxy client upfront
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_run(run_id=run_id, client=proxy_client)
+            class _Completions:
+                def __init__(self, client: "FailingJudgeClient") -> None:
+                    self.client = client
 
-    # judge_replay refuses proxy client
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_replay(step=step, replay=replay, client=proxy_client)
-
-    # judge_run refuses client with is_mock=True attribute
-    tricky_client = OpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-    tricky_client.is_mock = True  # type: ignore[attr-defined]
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_run(run_id=run_id, client=tricky_client)
-
-    # judge_replay refuses subclassed MockJudgeClient that wraps a live client
-    class SneakyJudgeMock(MockJudgeClient):
-        def __init__(self) -> None:
-            super().__init__()
-            self.live_backend = OpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
-
-    sneaky_judge = SneakyJudgeMock()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_replay(step=step, replay=replay, client=sneaky_judge)
-
-    # judge_replay refuses a client named MockJudgeClient defined outside server.app.judge
-    class ExternalMockJudgeClient:
-        pass
-
-    ExternalMockJudgeClient.__name__ = "MockJudgeClient"
-    external_mock = ExternalMockJudgeClient()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_replay(step=step, replay=replay, client=external_mock)
-
-    # judge_replay refuses a client with spoofed __module__ and __name__
-    class SpoofedFullIdentityClient:
-        pass
-
-    SpoofedFullIdentityClient.__name__ = "MockJudgeClient"
-    SpoofedFullIdentityClient.__module__ = "server.app.judge"
-    spoofed_full = SpoofedFullIdentityClient()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_replay(step=step, replay=replay, client=spoofed_full)
-
-    # judge_replay refuses an object spoofing unittest.mock attributes
-    class SpoofedMockAttributeClient:
-        def __init__(self) -> None:
-            self._mock_self = True
-
-    spoofed_mock = SpoofedMockAttributeClient()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_replay(step=step, replay=replay, client=spoofed_mock)
-
-    # judge_replay refuses slotted proxy hiding a live client
-    class SlottedJudgeProxy:
-        __slots__ = ("_live_inner",)
+                def create(self, *args: Any, **kwargs: Any) -> Any:
+                    self.client.call_count += 1
+                    if self.client.call_count == 1:
+                        raise TimeoutError("Nebius connection timed out during live judge call")
+                    return _MockJudgeResponse(
+                        choices=[
+                            _MockJudgeChoice(
+                                message=_MockJudgeMessage(
+                                    content=json.dumps(
+                                        {"score": 0.9, "verdict": "pass", "reason": "ok"}
+                                    )
+                                )
+                            )
+                        ],
+                        usage=_MockJudgeUsage(),
+                    )
 
         def __init__(self) -> None:
-            self._live_inner = OpenAI(api_key="mock", base_url="https://api.mock.nebius/v1")
+            self.call_count = 0
+            self.chat = self._Chat(self)
 
-    slotted_proxy = SlottedJudgeProxy()
-    with pytest.raises(
-        RuntimeError, match="REFUSAL: Cannot execute judge against live provider client"
-    ):
-        judge_replay(step=step, replay=replay, client=slotted_proxy)
+    client = FailingJudgeClient()
 
-    # Verify execution_mode gate refusal when execution_mode is offline (default)
-    with pytest.raises(RuntimeError, match="execution_mode is 'offline'"):
-        judge_replay(step=step, replay=replay, client=sub_client, execution_mode="offline")
-
-    # Verify execution_mode="live" still refuses when live pricing is unverified
     with pytest.raises(
         RuntimeError,
-        match="REFUSAL: Cannot execute judge against live provider client: prices.yaml has verified_for_live=false",
+        match="Halting live judging for run .* previous judge call encountered unreconciled judge costs",
     ):
-        judge_replay(step=step, replay=replay, client=sub_client, execution_mode="live")
+        judge_run(run_id=run_id, client=client, is_live=True)
+
+    # Exactly 1 request was dispatched; the second was blocked before dispatch
+    assert client.call_count == 1
+
+    with Session(db_mod.engine) as session:
+        ev1 = session.exec(select(Evaluation).where(Evaluation.replay_id == rep1.id)).first()
+        assert ev1 is not None
+        assert ev1.judge_score is None
+        assert ev1.judge_reason is not None
+        assert "[ERROR]" in ev1.judge_reason
+        assert "UNRECONCILED_JUDGE_COST" in ev1.judge_reason
+        assert ev1.judge_tokens_in is None
+        assert ev1.judge_cost_usd is None
+
+        ev2 = session.exec(select(Evaluation).where(Evaluation.replay_id == rep2.id)).first()
+        if ev2 is not None:
+            assert ev2.judge_reason is None or "UNRECONCILED_JUDGE_COST" not in ev2.judge_reason
+
+
+# 20. Test: A separate invocation is blocked if unreconciled judge costs exist
+def test_judge_live_separate_invocation_is_blocked() -> None:
+    """A subsequent invocation of judge_run refuses to run if the run has persistent UNRECONCILED_JUDGE_COST."""
+    run_id, step_id = _create_sample_run_with_step(kind="text")
+    rep = _create_sample_replay(step_id, tier="super")
+
+    with Session(db_mod.engine) as session:
+        ev = Evaluation(
+            replay_id=rep.id,
+            objective_pass=True,
+            judge_score=None,
+            judge_reason=(
+                "[ERROR] TimeoutError: connection lost "
+                "[UNRECONCILED_JUDGE_COST: live judge request dispatched but failed ambiguously; "
+                "further live judging halted]"
+            ),
+            judge_model="nvidia/Nemotron-3-Ultra-550b-a55b",
+        )
+        session.add(ev)
+        session.commit()
+
+    called = False
+
+    class DummyClient:
+        class _Chat:
+            class _Completions:
+                def create(self, *args: Any, **kwargs: Any) -> Any:
+                    nonlocal called
+                    called = True
+                    raise AssertionError("Should never be called")
+
+            completions = _Completions()
+
+        chat = _Chat()
+
+    client = DummyClient()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Live judging refused for run .* run contains persistent unreconciled judge costs",
+    ):
+        judge_run(run_id=run_id, client=client, is_live=True)
+
+    assert called is False
+
+
+# 21. Test: --force cannot bypass unreconciled block
+def test_judge_live_force_cannot_bypass_unreconciled_block() -> None:
+    """--force flag cannot bypass the persistent UNRECONCILED_JUDGE_COST block."""
+    run_id, step_id = _create_sample_run_with_step(kind="text")
+    rep = _create_sample_replay(step_id, tier="super")
+
+    with Session(db_mod.engine) as session:
+        ev = Evaluation(
+            replay_id=rep.id,
+            objective_pass=True,
+            judge_score=None,
+            judge_reason=(
+                "[ERROR] TimeoutError: connection dropped "
+                "[UNRECONCILED_JUDGE_COST: live judge request dispatched but failed ambiguously; "
+                "further live judging halted]"
+            ),
+            judge_model="nvidia/Nemotron-3-Ultra-550b-a55b",
+        )
+        session.add(ev)
+        session.commit()
+
+    called = False
+
+    class DummyClient:
+        class _Chat:
+            class _Completions:
+                def create(self, *args: Any, **kwargs: Any) -> Any:
+                    nonlocal called
+                    called = True
+                    raise AssertionError("Should never be called")
+
+            completions = _Completions()
+
+        chat = _Chat()
+
+    client = DummyClient()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Live judging refused for run .* run contains persistent unreconciled judge costs",
+    ):
+        judge_run(run_id=run_id, client=client, force=True, is_live=True)
+
+    assert called is False
+
+
+# 22. Test: Missing usage triggers persistent safety block
+def test_judge_live_missing_usage_triggers_persistent_safety_block() -> None:
+    """When a live judge call succeeds with HTTP 200 but returns no usage metadata, it triggers UNRECONCILED_JUDGE_COST."""
+    run_id, step_id = _create_sample_run_with_step(kind="text")
+    rep = _create_sample_replay(step_id, tier="super")
+
+    # Client returns valid JSON choices but usage=None
+    client = MockJudgeClient(
+        default_score=0.9,
+        default_verdict="pass",
+        default_reason="Output looks good.",
+        include_usage=False,
+    )
+
+    with Session(db_mod.engine) as session:
+        step = session.get(Step, step_id)
+        assert step is not None
+        ev = judge_replay(step, rep, client=client, session=session, is_live=True)
+
+    assert ev.judge_score is None
+    assert ev.judge_reason is not None
+    assert "[ERROR]" in ev.judge_reason
+    assert "UNRECONCILED_JUDGE_COST" in ev.judge_reason
+    assert "missing or malformed usage metadata" in ev.judge_reason
+    assert ev.judge_tokens_in is None
+    assert ev.judge_cost_usd is None
+
+    # Next invocation for the run is blocked
+    with pytest.raises(
+        RuntimeError,
+        match="Live judging refused for run .* run contains persistent unreconciled judge costs",
+    ):
+        judge_run(run_id=run_id, client=client, is_live=True)
+
+
+# 23. Test: Successful calls reconcile token usage and cost
+def test_judge_live_successful_calls_reconcile_token_usage_and_cost() -> None:
+    """Successful live judge calls properly record judge_tokens_in, judge_tokens_out, and judge_cost_usd."""
+    run_id, step_id = _create_sample_run_with_step(kind="text")
+    rep = _create_sample_replay(step_id, tier="super")
+
+    client = MockJudgeClient(
+        default_score=0.88,
+        default_verdict="pass",
+        default_reason="Semantic accuracy preserved.",
+        include_usage=True,
+        prompt_tokens=250,
+        completion_tokens=50,
+    )
+
+    evals = judge_run(run_id=run_id, client=client, is_live=True)
+    assert len(evals) == 1
+    ev = evals[0]
+
+    assert ev.judge_score == 0.88
+    assert ev.judge_reason is not None
+    assert ev.judge_reason.startswith("[PASS]")
+    assert ev.judge_tokens_in == 250
+    assert ev.judge_tokens_out == 50
+    assert ev.judge_cost_usd is not None
+    # For Ultra ($1.00/Mtok in, $3.00/Mtok out):
+    # 250 * 1e-6 + 50 * 3e-6 = 0.00025 + 0.00015 = 0.00040
+    assert abs(ev.judge_cost_usd - 0.00040) < 1e-6
+
+    # Verify replay record itself was not altered
+    with Session(db_mod.engine) as session:
+        rep_db = session.get(Replay, rep.id)
+        assert rep_db is not None
+        assert rep_db.cost_usd == rep.cost_usd
+
+
+# 24. Test: Existing objective evaluations remain unchanged
+def test_judge_live_preserves_existing_objective_evaluations() -> None:
+    """LLM judging must never overwrite or modify pre-existing objective evaluation fields."""
+    run_id, step_id = _create_sample_run_with_step(kind="text")
+    rep = _create_sample_replay(step_id, tier="super")
+
+    with Session(db_mod.engine) as session:
+        step = session.get(Step, step_id)
+        assert step is not None
+        initial_ev = evaluate_replay(step, rep, session)
+        obj_pass = initial_ev.objective_pass
+        obj_detail = dict(initial_ev.objective_detail or {})
+        initial_ev_id = initial_ev.id
+
+    client = MockJudgeClient(
+        default_score=0.95,
+        default_verdict="pass",
+        default_reason="High quality response.",
+        include_usage=True,
+        prompt_tokens=180,
+        completion_tokens=40,
+    )
+
+    evals = judge_run(run_id=run_id, client=client, is_live=True)
+    assert len(evals) == 1
+    final_ev = evals[0]
+
+    assert final_ev.id == initial_ev_id
+    # Objective evaluation fields remain 100% intact
+    assert final_ev.objective_pass == obj_pass
+    assert final_ev.objective_detail == obj_detail
+    # Semantic judge fields populated
+    assert final_ev.judge_score == 0.95
+    assert final_ev.judge_tokens_in == 180
+    assert final_ev.judge_tokens_out == 40
+    assert final_ev.judge_cost_usd is not None
+
+
+# 25. Test: Cost ceiling aborts before dispatch
+def test_judge_live_cost_ceiling_aborts_before_dispatch() -> None:
+    """Judge run aborts before dispatch if prospective request cost exceeds cost ceiling."""
+    run_id, step_id = _create_sample_run_with_step(kind="text")
+    _create_sample_replay(step_id, tier="super")
+
+    client_called = False
+
+    class DummyClient:
+        class _Chat:
+            class _Completions:
+                def create(self, *args: Any, **kwargs: Any) -> Any:
+                    nonlocal client_called
+                    client_called = True
+                    raise AssertionError("Should never be called")
+
+            completions = _Completions()
+
+        chat = _Chat()
+
+    client = DummyClient()
+
+    # Budget ceiling set to an impossibly low $0.000001, which cannot cover prospective judge call
+    with pytest.raises(
+        RuntimeError,
+        match="Judge cost ceiling of .* reached: .* exceeds budget",
+    ):
+        judge_run(run_id=run_id, client=client, is_live=True, cost_ceiling_usd=0.000001)
+
+    assert client_called is False
+
+
+# 26. Test: Truncated output explicitly handled
+def test_judge_truncated_output_explicitly_handled() -> None:
+    """Truncated judge response cutting off mid-JSON is explicitly flagged as truncated error."""
+    _run_id, step_id = _create_sample_run_with_step(kind="text")
+    replay = _create_sample_replay(step_id)
+
+    with Session(db_mod.engine) as session:
+        step = session.get(Step, step_id)
+        assert step is not None
+
+        truncated_raw = '{\n  "score": 0.95,\n  "verdict": "pass",\n  "reason": "The candidate output accurately'
+        client = MockJudgeClient(scenario_handlers={"Compare the following": truncated_raw})
+        ev = judge_replay(step, replay, client=client, session=session)
+
+        assert ev.judge_score is None
+        assert ev.judge_reason is not None
+        assert ev.judge_reason.startswith("[ERROR]")
+        assert "Truncated judge output" in ev.judge_reason
+
+
+# 27. Test: Preamble and postamble around JSON are stripped cleanly
+def test_judge_extracts_json_with_surrounding_preamble() -> None:
+    """Judge extracts valid JSON even when conversational reasoning preambles are present."""
+    _run_id, step_id = _create_sample_run_with_step(kind="text")
+    replay = _create_sample_replay(step_id)
+
+    with Session(db_mod.engine) as session:
+        step = session.get(Step, step_id)
+        assert step is not None
+
+        raw_with_preamble = (
+            "We are evaluating the candidate output against the reference output.\n"
+            '{"score": 0.88, "verdict": "pass", "reason": "Candidate output preserves intent and accuracy."}\n'
+            "End of evaluation."
+        )
+        client = MockJudgeClient(scenario_handlers={"Compare the following": raw_with_preamble})
+        ev = judge_replay(step, replay, client=client, session=session)
+
+        assert ev.judge_score == 0.88
+        assert ev.judge_reason is not None
+        assert ev.judge_reason.startswith("[PASS]")
+
+
+# 28. Test: Missing numeric score for pass/fail is rejected
+def test_judge_missing_score_for_pass_fail_is_rejected() -> None:
+    """A pass/fail verdict without a numeric score must be marked as an error, never passing."""
+    _run_id, step_id = _create_sample_run_with_step(kind="text")
+    replay = _create_sample_replay(step_id)
+
+    with Session(db_mod.engine) as session:
+        step = session.get(Step, step_id)
+        assert step is not None
+
+        payload = {"score": None, "verdict": "pass", "reason": "Good output without numeric score."}
+        client = MockJudgeClient(scenario_handlers={"Compare the following": json.dumps(payload)})
+        ev = judge_replay(step, replay, client=client, session=session)
+
+        assert ev.judge_score is None
+        assert ev.judge_reason is not None
+        assert ev.judge_reason.startswith("[ERROR]")
+        assert "without a numeric score" in ev.judge_reason
+
+
+# 29. Test: Empty explanation reason is rejected
+def test_judge_empty_reason_is_rejected() -> None:
+    """An empty or whitespace-only explanation reason must be marked as an error."""
+    _run_id, step_id = _create_sample_run_with_step(kind="text")
+    replay = _create_sample_replay(step_id)
+
+    with Session(db_mod.engine) as session:
+        step = session.get(Step, step_id)
+        assert step is not None
+
+        payload = {"score": 0.9, "verdict": "pass", "reason": "   "}
+        client = MockJudgeClient(scenario_handlers={"Compare the following": json.dumps(payload)})
+        ev = judge_replay(step, replay, client=client, session=session)
+
+        assert ev.judge_score is None
+        assert ev.judge_reason is not None
+        assert ev.judge_reason.startswith("[ERROR]")
+        assert "empty explanation reason" in ev.judge_reason
